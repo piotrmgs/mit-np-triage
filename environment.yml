@@ -1,0 +1,25 @@
+name: puiseux-cvnn          
+channels:
+  - pytorch                
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pytorch                
+  - torchvision
+  - torchaudio
+  - numpy
+  - scipy
+  - pandas
+  - scikit-learn
+  - sympy
+  - matplotlib
+  - tqdm
+  - seaborn
+  - psutil 
+  - pip:
+    - torch-complex
+    - lime
+    - shap
+    - wfdb
+

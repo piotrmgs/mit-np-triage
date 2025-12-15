@@ -244,84 +244,89 @@ if __name__ == "__main__":
     x_sym, y_sym = sympy.symbols('x y')
 
     # ----------------------------------------------------------------------
-    # 3) Sensitivity (tau, delta) summary if available
+    # 3) Sensitivity (tau, delta) summary (prefer extended grid if available)
     # ----------------------------------------------------------------------
-    sens_grid = os.path.join(IN_DIR, 'sens_grid.csv')
-    if os.path.isfile(sens_grid):
-        rows = []
-        with open(sens_grid, 'r', newline='') as f:
-            rdr = csv.DictReader(f)
-            for r in rdr:
-                try:
-                    tau = float(r.get('tau', 'nan'))
-                    delta = float(r.get('delta', 'nan'))
-                    abstain = float(r.get('abstain', 'nan'))
-                    capture = float(r.get('capture', 'nan'))
-                    precision = float(r.get('precision', 'nan'))
-                    dispersion = float(r.get('dispersion', 'nan'))
-                    risk = float(r.get('risk_accept', 'nan'))
-                    kink = float(r.get('kink', 'nan'))
-                    rows.append((tau, delta, abstain, capture, precision, dispersion, risk, kink))
-                except Exception:
-                    continue
-        R = np.array(rows, dtype=float) if rows else np.empty((0, 8))
-        
-        # Additional description: number of anchors, dispersion, and their "value" vs (tau, delta).
-        # (Assumes 'dispersion' and 'capture' are present; else NaN.)
-        try:
-            n_anchors = int(np.nansum(R[:, 3] > 0))  # anchor counted if capture>0
-        except Exception:
-            n_anchors = int(np.sum(~np.isnan(R[:, 0])))
+    sens_grid_ext_path  = os.path.join(IN_DIR, "sens_grid_ext.csv")
+    sens_grid_legacy    = os.path.join(IN_DIR, "sens_grid.csv")
+    sens_full_path      = os.path.join(IN_DIR, "sens_full.csv")
+    sens_full_multi_path = os.path.join(IN_DIR, "sens_full_multi.csv")
 
-        sens_table_csv = os.path.join(OUT_DIR, "sensitivity_detailed.csv")
-        with open(sens_table_csv, "w", newline="") as ftab:
-            w = csv.writer(ftab)
-            w.writerow(["tau","delta","abstain","capture","precision","dispersion","risk_accept","kink"])
-            for r in rows:
-                w.writerow(list(r))
-
-        with open(os.path.join(OUT_DIR, "sensitivity_summary.txt"), "a") as f:
-            f.write(f"Anchors (count proxy) : {n_anchors}\n")
-            if R.size:
-                f.write(f"dispersion median     : {np.nanmedian(R[:,5]):.3f}\n")
-                f.write(f"capture median        : {np.nanmedian(R[:,3]):.3f}\n")
-
-        
-        if R.size:
-            cap = R[:, 3]
-            disp = R[:, 5]
-            if np.std(cap) > 0 and np.std(disp) > 0:
-                corr_cap_disp = float(np.corrcoef(cap, disp)[0, 1])
-            else:
-                corr_cap_disp = float('nan')
-            # Best under abstain <= 0.20 (example budget).
-            mask_budget = R[:, 2] <= min(0.20, np.nanmax(R[:, 2])) if R.size else np.zeros((), dtype=bool)
-            best_idx = int(np.argmax(R[mask_budget, 3])) if np.any(mask_budget) else -1
-            best_tuple = R[mask_budget][best_idx].tolist() if best_idx >= 0 else []
-
-            sens_summary = os.path.join(OUT_DIR, "sensitivity_summary.txt")
-            with open(sens_summary, "w") as f:
-                f.write("=== Sensitivity (tau, delta) summary ===\n")
-                f.write(f"Grid points: {len(R)}\n")
-                f.write(f"Corr(capture, dispersion): {corr_cap_disp:.3f}\n")
-                if best_tuple:
-                    f.write("Best under abstain<=0.20: ")
-                    f.write(f"(tau={best_tuple[0]:.3f}, delta={best_tuple[1]:.3f}) | ")
-                    f.write(f"abstain={best_tuple[2]:.3f}, capture={best_tuple[3]:.3f}, ")
-                    f.write(f"precision={best_tuple[4]:.3f}, dispersion={best_tuple[5]:.3f}, risk={best_tuple[6]:.3f}\n")
-
-            # Additional summary of ranges/medians.
-            with open(os.path.join(OUT_DIR, "sensitivity_extra.txt"), "w") as f:
-                f.write(f"abstain range    : [{np.nanmin(R[:,2]):.3f}, {np.nanmax(R[:,2]):.3f}]\n")
-                f.write(f"capture  range   : [{np.nanmin(R[:,3]):.3f}, {np.nanmax(R[:,3]):.3f}]\n")
-                f.write(f"precision median : {np.nanmedian(R[:,4]):.3f}\n")
-                f.write(f"risk_accept median: {np.nanmedian(R[:,6]):.3f}\n")
-
-            print(f"[INFO] Sensitivity summary saved to {sens_summary}")
-        else:
-            print("[WARN] sens_grid.csv has no usable rows; skipping sensitivity summary.")
+    df_sens = None
+    if os.path.isfile(sens_grid_ext_path):
+        df_sens = pd.read_csv(sens_grid_ext_path)
+        df_sens.to_csv(os.path.join(OUT_DIR, "sensitivity_detailed.csv"), index=False)
+        logger.info("Loaded EXT sensitivity grid: %s (rows=%d)", sens_grid_ext_path, len(df_sens))
+    elif os.path.isfile(sens_grid_legacy):
+        df_sens = pd.read_csv(sens_grid_legacy)
+        # legacy file has fewer columns; just copy it as detailed for backward compat
+        df_sens.to_csv(os.path.join(OUT_DIR, "sensitivity_detailed.csv"), index=False)
+        logger.info("Loaded LEGACY sensitivity grid: %s (rows=%d)", sens_grid_legacy, len(df_sens))
     else:
-        print("[WARN] Sensitivity grid not found.")
+        logger.warning("No sensitivity grid found (sens_grid_ext.csv nor sens_grid.csv).")
+
+    df_multi = None
+    if os.path.isfile(sens_full_multi_path):
+        df_multi = pd.read_csv(sens_full_multi_path)
+        df_multi.to_csv(os.path.join(OUT_DIR, "sensitivity_multi.csv"), index=False)
+        logger.info("Loaded multi-budget sensitivity summary: %s (rows=%d)", sens_full_multi_path, len(df_multi))
+
+    chosen = None
+    if os.path.isfile(sens_full_path):
+        try:
+            tmp = pd.read_csv(sens_full_path)
+            if len(tmp):
+                chosen = tmp.iloc[0].to_dict()
+                logger.info("Loaded chosen (tau*,delta*) from sens_full.csv: tau=%.6f delta=%.6f",
+                            float(chosen.get("tau", float("nan"))), float(chosen.get("delta", float("nan"))))
+        except Exception as e:
+            logger.warning("Failed to parse sens_full.csv: %s", e)
+
+    # Write one coherent summary (no append/overwrite chaos)
+    sum_path = os.path.join(OUT_DIR, "sensitivity_summary.txt")
+    with open(sum_path, "w") as f:
+        f.write("=== Sensitivity summary (post_processing_real) ===\n")
+        f.write(f"Anchors (uncertain points): {len(up_list)}\n")
+        if df_sens is None or df_sens.empty:
+            f.write("Grid: N/A\n")
+        else:
+            f.write(f"Grid rows: {len(df_sens)}\n")
+            for col in ["tau", "delta"]:
+                if col in df_sens.columns:
+                    f.write(f"{col} range: [{df_sens[col].min():.6f}, {df_sens[col].max():.6f}]\n")
+            # Prefer exact columns if present
+            if "abstain_exact" in df_sens.columns:
+                f.write(f"abstain_exact median: {df_sens['abstain_exact'].median():.6f}\n")
+            if "risk_accept_exact" in df_sens.columns:
+                f.write(f"risk_accept_exact median: {df_sens['risk_accept_exact'].median():.6f}\n")
+            if "capture_exact" in df_sens.columns:
+                f.write(f"capture_exact median: {df_sens['capture_exact'].median():.6f}\n")
+
+            # Simple “best under budget” views if the columns exist
+            if "abstain_exact" in df_sens.columns and "risk_accept_exact" in df_sens.columns:
+                for b in [0.01, 0.02, 0.05, 0.10, 0.20]:
+                    sub = df_sens[df_sens["abstain_exact"] <= b]
+                    if len(sub):
+                        best = sub.loc[sub["risk_accept_exact"].idxmin()]
+                        f.write(f"\nBest risk under abstain<= {b:.2f}:\n")
+                        f.write(f"  tau={best['tau']:.6f}, delta={best['delta']:.6f}, "
+                                f"risk={best['risk_accept_exact']:.6f}, "
+                                f"coverage={best.get('coverage_exact', float('nan')):.6f}, "
+                                f"capture={best.get('capture_exact', float('nan')):.6f}\n")
+
+        if chosen is not None:
+            f.write("\nChosen (tau*,delta*) from sens_full.csv:\n")
+            f.write(f"  tau*={chosen.get('tau')}, delta*={chosen.get('delta')}\n")
+            for k in ["abstain", "capture", "precision", "risk_accept", "kink_score"]:
+                if k in chosen:
+                    f.write(f"  {k}={chosen.get(k)}\n")
+
+        if df_multi is not None and len(df_multi):
+            f.write("\nMulti-budget table (sens_full_multi.csv):\n")
+            f.write(df_multi.to_string(index=False))
+            f.write("\n")
+
+    logger.info("Saved sensitivity summary -> %s", sum_path)
+
 
     # ----------------------------------------------------------------------
     # 4) Comparative calibration table with 95% CI (+ Wilcoxon, win-rate)
@@ -529,22 +534,44 @@ if __name__ == "__main__":
         # ------------------------------------------------------------------
         # (D) LIME & SHAP with temperature (apply scaler consistently)
         # ------------------------------------------------------------------
-        xstar_reshaped = xstar.reshape(1, -1).astype(np.float32)
-        xstar_scaled = (scaler_full.transform(xstar_reshaped) 
-                        if scaler_full is not None else xstar_reshaped)
+        # NOTE: uncertain_full.csv stores X already in *model input space* (scaled by scaler_full in up_real.py).
+        # Therefore: DO NOT transform xstar again here.
+        xstar_model = xstar.reshape(1, -1).astype(np.float32)
 
-        # LIME.
-        lime_exp = compute_lime_explanation(model, X_train, xstar_scaled[0], device, T=T)
-        lime_list = lime_exp.as_list()
-        print("\n[LIME Explanation]")
-        for feat, val in lime_list:
-            print(f" {feat}: {val:.3f}")
+        # LIME
+        lime_list = []
+        try:
+            lime_exp = compute_lime_explanation(model, X_train, xstar_model[0], device, T=T)
+            lime_list = lime_exp.as_list()
+            print("\n[LIME Explanation]")
+            for feat, val in lime_list:
+                print(f" {feat}: {val:.3f}")
+        except Exception as e:
+            logger.warning("LIME failed for point %d: %s", i, e)
 
-        # SHAP.
-        shap_vals = compute_shap_explanation(
-            model, xstar_scaled, device,
-            background=X_train[:10], num_samples=100, T=T
-        )
+        # SHAP
+        shap_class0 = None
+        shap_class1 = None
+        try:
+            shap_vals = compute_shap_explanation(
+                model, xstar_model, device,
+                background=X_train[:10], num_samples=100, T=T
+            )
+            shap_c = _normalize_shap_output(shap_vals)
+            shap_class0 = shap_c[0][0]
+            shap_class1 = (shap_c[1][0] if shap_c[1] is not None else None)
+
+            print("\n[SHAP Explanation] per feature:")
+            for fid, feat_name in enumerate(["Re(z1)", "Re(z2)", "Im(z1)", "Im(z2)"]):
+                if shap_class1 is None:
+                    print("  {} => shap: {:.3f}".format(feat_name, scalarize(shap_class0[fid])))
+                else:
+                    print("  {} => shap0: {:.3f}, shap1: {:.3f}".format(
+                        feat_name, scalarize(shap_class0[fid]), scalarize(shap_class1[fid])
+                    ))
+        except Exception as e:
+            logger.warning("SHAP failed for point %d: %s", i, e)
+
         shap_c = _normalize_shap_output(shap_vals)
         shap_class0 = shap_c[0][0]
         shap_class1 = (shap_c[1][0] if shap_c[1] is not None else None)
@@ -881,7 +908,19 @@ if __name__ == "__main__":
                         f"{('N/A' if np.isnan(r_flip) else f'{r_flip:.6f}')}\n\n")
 
             # 4) Collect for a CSV summary across all anchors
-            dom_rows.append([i, max_abs_c2, max_abs_c4, r_dom, r_flip])
+            dom_rows.append([
+                i,
+                max_abs_c2,
+                max_abs_c4,
+                r_dom,
+                r_flip,          # r_flip = observed min flip radius
+                flip_grad if flip_grad is not None else np.nan,
+                flip_lime if flip_lime is not None else np.nan,
+                flip_shap if flip_shap is not None else np.nan,
+                float(sal.get("grad_norm", np.nan)),
+                float(kdiag.get("frac_kink", np.nan)),
+            ])
+
 
             
             
@@ -1050,8 +1089,19 @@ if __name__ == "__main__":
             "point","kept_ratio","cond","degree_used","RMSE","sign_agree",
             "resid_mean","resid_std","resid_skew","resid_kurt"
         ]).to_csv(os.path.join(OUT_DIR,"local_fit_summary.csv"), index=False)
-        pd.DataFrame(dom_rows, columns=["point","max_abs_c2","max_abs_c4","r_dom","r_flip"]).to_csv(
-            os.path.join(OUT_DIR,"dominant_ratio_summary.csv"), index=False)
+        pd.DataFrame(dom_rows, columns=[
+            "point",
+            "c2_max_abs",
+            "c4_max_abs",
+            "r_dom",
+            "r_flip_obs",
+            "flip_grad",
+            "flip_lime",
+            "flip_shap",
+            "saliency_grad_norm",
+            "frac_kink",
+        ]).to_csv(os.path.join(OUT_DIR, "dominant_ratio_summary.csv"), index=False)
+
 
 
         # --- GLOBAL kink report ---

@@ -36,14 +36,27 @@ import logging
 import pickle
 import csv
 import psutil
+import json
+import platform
+from typing import Dict, List, Tuple, Optional
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from sklearn.model_selection import KFold, train_test_split
-from sklearn.metrics import f1_score
 import time
-from sklearn.metrics import accuracy_score, roc_auc_score
+from sklearn.metrics import (
+    f1_score,
+    accuracy_score,
+    roc_auc_score,
+    average_precision_score,
+    balanced_accuracy_score,
+    precision_score,
+    recall_score,
+    confusion_matrix,
+)
+from scipy import stats
+
 
 # ───────────────────────────────────────────────────────────
 #  Project imports
@@ -177,6 +190,48 @@ def parse_args():
                         help="2D projection method for penultimate features (default: tsne).")
 
 
+    # ---- Paper-grade calibration metric config ----
+    parser.add_argument(
+        "--ece_bins",
+        type=int,
+        default=15,
+        help="Number of bins for ECE (default 15)."
+    )
+    parser.add_argument(
+        "--ece_strategy",
+        type=str,
+        default="quantile",
+        choices=["quantile", "uniform"],
+        help="ECE binning strategy (default quantile = equal-frequency)."
+    )
+
+    # ---- FULL model split (patient-wise, record-level) ----
+    parser.add_argument(
+        "--full_test_fold",
+        type=int,
+        default=1,
+        help="Which fold (1..K) to use as TEST records for the full-model retrain (patient-wise)."
+    )
+    parser.add_argument(
+        "--full_val_fold",
+        type=int,
+        default=2,
+        help="Which fold (1..K) to use as VAL records for the full-model retrain (patient-wise)."
+    )
+    parser.add_argument(
+        "--save_full_predictions",
+        action="store_true",
+        default=True,
+        help="Save full-model VAL/TEST predictions to CSV (ON by default)."
+    )
+    parser.add_argument(
+        "--no-save_full_predictions",
+        dest="save_full_predictions",
+        action="store_false",
+        help="Disable saving full-model VAL/TEST predictions CSVs."
+    )
+
+
     return parser.parse_args()
 
 
@@ -205,12 +260,12 @@ def _parse_float_csv(s: str):
 def _default_tau_delta_grid():
     """
     Strong default grid:
-    - tau: coarse in [0.50..0.90], fine in [0.90..0.99]
+    - tau: coarse in [0.50..0.90], fine in [0.90..0.95]
     - delta: dense near 0 (most action happens there), then medium, then coarse tail
     """
     taus = np.unique(np.concatenate([
         np.linspace(0.50, 0.90, 9),     # 0.50,0.55,...,0.90
-        np.linspace(0.90, 0.99, 10),    # 0.90,0.91,...,0.99
+        np.linspace(0.90, 0.95, 6),     # 0.90,0.91,...,0.95
     ])).astype(float)
 
     deltas = np.unique(np.concatenate([
@@ -220,6 +275,141 @@ def _default_tau_delta_grid():
     ])).astype(float)
 
     return taus, deltas
+
+
+
+def _safe_write_json(path: str, payload: Dict):
+    """Write JSON with a hard fallback (never crash the run for metadata)."""
+    try:
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2, sort_keys=True, default=str)
+    except Exception as e:
+        logging.warning("Could not write json=%s: %s", path, e)
+
+
+def _mean_ci_t(values: List[float], alpha: float = 0.05) -> Tuple[float, float]:
+    """Student-t CI half-width (matches paper-style CI)."""
+    vals = [float(v) for v in values if v is not None and not np.isnan(v)]
+    n = len(vals)
+    if n == 0:
+        return float("nan"), float("nan")
+    m = float(np.mean(vals))
+    if n == 1:
+        return m, 0.0
+    sd = float(np.std(vals, ddof=1))
+    tcrit = float(stats.t.ppf(1.0 - alpha/2.0, df=n-1))
+    hw = tcrit * sd / (n ** 0.5)
+    return m, float(hw)
+
+
+def _ece_binary(y_true: np.ndarray, y_prob_pos: np.ndarray, n_bins: int = 15, strategy: str = "quantile") -> float:
+    """
+    Binary ECE for P(y=1):
+      ECE = sum_b | mean(y) - mean(p) | * (n_b / n)
+    with either uniform or quantile (equal-frequency) bins.
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    y_prob_pos = np.asarray(y_prob_pos, dtype=float)
+    n = int(y_true.size)
+    if n == 0:
+        return float("nan")
+
+    p = np.clip(y_prob_pos, 0.0, 1.0)
+    if strategy == "quantile":
+        edges = np.quantile(p, np.linspace(0.0, 1.0, n_bins + 1))
+        # de-duplicate / enforce strictly increasing edges
+        eps = 1e-12
+        for i in range(1, len(edges)):
+            if edges[i] <= edges[i-1]:
+                edges[i] = min(1.0, edges[i-1] + eps)
+    else:
+        edges = np.linspace(0.0, 1.0, n_bins + 1)
+
+    ece = 0.0
+    for b in range(n_bins):
+        lo, hi = float(edges[b]), float(edges[b + 1])
+        if b < n_bins - 1:
+            mask = (p >= lo) & (p < hi)
+        else:
+            mask = (p >= lo) & (p <= hi)
+        nb = int(mask.sum())
+        if nb == 0:
+            continue
+        acc_b = float(y_true[mask].mean())
+        conf_b = float(p[mask].mean())
+        ece += abs(acc_b - conf_b) * (nb / n)
+    return float(ece)
+
+
+def _binary_clf_metrics(y_true: List[int], y_pred: List[int], y_prob_pos: List[float]) -> Dict[str, float]:
+    """Common paper metrics for binary arrhythmia detection."""
+    yt = np.asarray(y_true, dtype=int)
+    yp = np.asarray(y_pred, dtype=int)
+    ps = np.asarray(y_prob_pos, dtype=float)
+    out: Dict[str, float] = {}
+    out["acc"] = float(accuracy_score(yt, yp)) if yt.size else float("nan")
+    out["bacc"] = float(balanced_accuracy_score(yt, yp)) if yt.size else float("nan")
+    out["f1"] = float(f1_score(yt, yp, zero_division=0)) if yt.size else float("nan")
+    out["precision"] = float(precision_score(yt, yp, zero_division=0)) if yt.size else float("nan")
+    out["recall"] = float(recall_score(yt, yp, zero_division=0)) if yt.size else float("nan")
+    # specificity from confusion matrix
+    try:
+        tn, fp, fn, tp = confusion_matrix(yt, yp, labels=[0, 1]).ravel()
+        out["specificity"] = float(tn / (tn + fp)) if (tn + fp) > 0 else float("nan")
+    except Exception:
+        out["specificity"] = float("nan")
+
+    # AUROC/AUPRC can fail if only one class in yt
+    try:
+        out["auroc"] = float(roc_auc_score(yt, ps))
+    except Exception:
+        out["auroc"] = float("nan")
+    try:
+        out["auprc"] = float(average_precision_score(yt, ps))
+    except Exception:
+        out["auprc"] = float("nan")
+    return out
+
+
+def _collect_probs_on_loader(
+    model: nn.Module,
+    loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    calibration: str,
+    T: Optional[torch.Tensor],
+    iso_cal: Optional[callable],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Return (y_true, probs_raw, probs_cal, X_scaled) in the *dataset order*.
+    probs_* are numpy arrays of shape [N,2].
+    """
+    ys, pr_list, pc_list, xs = [], [], [], []
+    model.eval()
+    with torch.no_grad():
+        for xb, yb in loader:
+            xs.append(xb.cpu().numpy())
+            ys.append(yb.cpu().numpy())
+
+            xb_d = xb.to(device)
+            logits = complex_modulus_to_logits(model(xb_d))
+            probs_raw = nn.Softmax(dim=1)(logits)
+
+            if calibration == "temperature" and T is not None:
+                probs_cal = nn.Softmax(dim=1)(logits / T.to(device))
+            elif calibration == "isotonic" and iso_cal is not None:
+                probs_cal = torch.from_numpy(iso_cal(probs_raw.cpu().numpy())).to(dtype=torch.float32)
+            else:
+                probs_cal = probs_raw
+
+            pr_list.append(probs_raw.cpu().numpy())
+            pc_list.append(probs_cal.cpu().numpy())
+
+    y = np.concatenate(ys, axis=0).astype(int)
+    probs_r = np.concatenate(pr_list, axis=0).astype(float)
+    probs_c = np.concatenate(pc_list, axis=0).astype(float)
+    X = np.concatenate(xs, axis=0).astype(float)
+    return y, probs_r, probs_c, X
+
 
 
 def _selective_metrics_binary(y_true: np.ndarray, probs: np.ndarray, tau: float, delta: float):
@@ -339,24 +529,34 @@ def main():
 
     # Reproducibility: seed Python/NumPy/PyTorch (CPU/CUDA)
     seed_everything(args.seed)
+
+
+    # Determinism & numerical stability (match post_processing_real)
+    try:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+    except Exception:
+        pass
     
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
     logger.info("Using device: %s | seed=%d", device, args.seed)
     
     # Save run metadata (useful for reproducibility in rebuttals/appendices)
-    try:
-        import json, platform
-        meta = {
-            "seed": args.seed,
-            "device": str(device),
-            "python": platform.python_version(),
-            "numpy": np.__version__,
-            "torch": torch.__version__,
-        }
-        with open(os.path.join(args.output_folder, "run_meta.json"), "w") as f:
-            json.dump(meta, f, indent=2)
-    except Exception as _e:
-        logger.warning("Could not write run_meta.json: %s", _e)
+    meta = {
+        "seed": args.seed,
+        "device": str(device),
+        "python": platform.python_version(),
+        "numpy": np.__version__,
+        "torch": torch.__version__,
+        "cuda_available": bool(torch.cuda.is_available()),
+        "args": vars(args),
+        "record_names": record_names,
+    }
+    _safe_write_json(os.path.join(args.output_folder, "run_meta.json"), meta)
+    _safe_write_json(os.path.join(args.output_folder, "run_args.json"), vars(args))
 
     # ── Global collectors across folds ─────────────────────────────────    
     histories_all_folds = []
@@ -370,6 +570,8 @@ def main():
     # RAW baseline collectors for calibration (no temperature scaling)
     y_true_all_raw = []
     y_prob_all_pos_raw = []
+    y_pred_all_raw = []
+    y_conf_all_max_raw = []
 
     y_margin_all = []        
     pred_rows_all = []        
@@ -377,16 +579,35 @@ def main():
     # K-fold CV over patients/records
     kf = KFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
 
-    # Per-fold metrics (RAW vs TS)
+    # Per-fold metrics (RAW vs CAL)
     ece_raw_folds, ece_ts_folds = [], []
     nll_raw_folds, nll_ts_folds = [], []
     br_raw_folds,  br_ts_folds  = [], []
     acc_ts_folds, auc_ts_folds  = [], []
 
+    acc_raw_folds, auc_raw_folds = [], []
+
+    # Classification metrics (paper-friendly)
+    f1_raw_folds, f1_ts_folds = [], []
+    bacc_raw_folds, bacc_ts_folds = [], []
+    ap_raw_folds, ap_ts_folds = [], []
+    prec_raw_folds, prec_ts_folds = [], []
+    rec_raw_folds, rec_ts_folds = [], []
+    spec_raw_folds, spec_ts_folds = [], []
+
+    # Fold manifests for reproducibility
+    fold_manifest = []
+    fold_counts = []
+
+    # CV triage (pick tau/delta on VAL; evaluate on TEST)
+    triage_rows = []
+
     for fold, (train_idx, test_idx) in enumerate(kf.split(record_names), 1):
         train_recs = [record_names[i] for i in train_idx]
         test_recs = [record_names[i] for i in test_idx]
         logger.info("Fold %d  train=%s  test=%s", fold, train_recs, test_recs)
+        fold_manifest.append({"fold": fold, "train_records": train_recs, "test_records": test_recs})
+ 
 
         # ── Load raw (real-valued) windows ─────────────────
         X_train, y_train = load_mitbih_data(
@@ -395,6 +616,17 @@ def main():
         X_test, y_test = load_mitbih_data(
             args.data_folder, test_recs, WINDOW_SIZE, PRE_SAMPLES, FS
         )
+
+        # Basic split stats for paper appendix
+        bc_tr = np.bincount(np.asarray(y_train, dtype=int), minlength=2)
+        bc_te = np.bincount(np.asarray(y_test, dtype=int), minlength=2)
+        fold_counts.append({
+            "fold": fold,
+            "n_train": int(len(y_train)),
+            "n_test": int(len(y_test)),
+            "train_n0": int(bc_tr[0]), "train_n1": int(bc_tr[1]),
+            "test_n0": int(bc_te[0]),  "test_n1": int(bc_te[1]),
+        })
 
         # ───────────────────────────────────────────────────
         #  CVNN + complex_stats (main article path)
@@ -473,6 +705,7 @@ def main():
         y_true_raw, y_prob_pos_raw, y_max_raw = [], [], []
         y_true_ts,  y_prob_pos_ts,  y_max_ts  = [], [], []
         y_pred_ts = []
+        y_pred_raw = []
         probs_ts_all = []
         probs_raw_all = []
         yb_all = []
@@ -487,6 +720,7 @@ def main():
                 # RAW probabilities (always computed)
                 probs_raw = nn.Softmax(dim=1)(logits)
                 probs_raw_all.append(probs_raw.cpu())
+                y_pred_raw.extend(probs_raw.argmax(dim=1).cpu().tolist())
 
                 # Calibrated probabilities according to --calibration
                 if args.calibration == "temperature" and T_fold is not None:
@@ -512,7 +746,7 @@ def main():
                 y_pred_ts.extend(probs_ts.argmax(dim=1).cpu().tolist())
 
          
-        # Acc/AUC (TS) for this fold
+        # Acc/AUC (CAL) for this fold
         acc_ts = float((np.array(y_true_ts) == np.array(y_pred_ts)).mean())
         try:
             auc_ts = float(roc_auc_score(np.array(y_true_ts), np.array(y_prob_pos_ts)))
@@ -520,6 +754,25 @@ def main():
             auc_ts = float('nan')
         acc_ts_folds.append(acc_ts)
         auc_ts_folds.append(auc_ts)
+
+        # Acc/AUC (RAW) for this fold
+        acc_raw = float((np.array(y_true_raw) == np.array(y_pred_raw)).mean())
+        try:
+            auc_raw = float(roc_auc_score(np.array(y_true_raw), np.array(y_prob_pos_raw)))
+        except Exception:
+            auc_raw = float("nan")
+        acc_raw_folds.append(acc_raw)
+        auc_raw_folds.append(auc_raw)
+
+        # Classification metrics (RAW / CAL)
+        m_raw = _binary_clf_metrics(y_true_raw, y_pred_raw, y_prob_pos_raw)
+        m_ts  = _binary_clf_metrics(y_true_ts,  y_pred_ts,  y_prob_pos_ts)
+        f1_raw_folds.append(m_raw["f1"]); f1_ts_folds.append(m_ts["f1"])
+        bacc_raw_folds.append(m_raw["bacc"]); bacc_ts_folds.append(m_ts["bacc"])
+        ap_raw_folds.append(m_raw["auprc"]); ap_ts_folds.append(m_ts["auprc"])
+        prec_raw_folds.append(m_raw["precision"]); prec_ts_folds.append(m_ts["precision"])
+        rec_raw_folds.append(m_raw["recall"]); rec_ts_folds.append(m_ts["recall"])
+        spec_raw_folds.append(m_raw["specificity"]); spec_ts_folds.append(m_ts["specificity"])
         
         roc_auc = save_confusion_roc(y_true_ts, y_pred_ts, y_prob_pos_ts, args.output_folder, fold)
         logging.info(f"[Fold {fold}] ROC AUC (TS) = {roc_auc:.4f}")
@@ -588,10 +841,14 @@ def main():
         # Global collectors (RAW for baseline reliability curve)
         y_true_all_raw.extend(y_true_raw)
         y_prob_all_pos_raw.extend(y_prob_pos_raw)
+        y_pred_all_raw.extend(y_pred_raw)
+        y_conf_all_max_raw.extend(y_max_raw)
 
         # Per-fold metrics (RAW vs TS)
-        ece_raw = expected_calibration_error(np.array(y_true_raw), np.array(y_prob_pos_raw), n_bins=10)
-        ece_ts  = expected_calibration_error(np.array(y_true_ts),  np.array(y_prob_pos_ts),  n_bins=10)
+        ece_raw = _ece_binary(np.array(y_true_raw), np.array(y_prob_pos_raw),
+                              n_bins=args.ece_bins, strategy=args.ece_strategy)
+        ece_ts  = _ece_binary(np.array(y_true_ts),  np.array(y_prob_pos_ts),
+                              n_bins=args.ece_bins, strategy=args.ece_strategy)
         nll_raw = negative_log_likelihood(np.array(y_true_raw), np.array(y_prob_pos_raw))
         nll_ts  = negative_log_likelihood(np.array(y_true_ts),  np.array(y_prob_pos_ts))
         br_raw  = brier_score(np.array(y_true_raw), np.array(y_prob_pos_raw))
@@ -603,10 +860,45 @@ def main():
 
         cal_suffix = "TS" if args.calibration == "temperature" else ("ISO" if args.calibration == "isotonic" else "CAL")
         logger.info(
-            "[Fold %d] epoch_avg=%.2fs | params=%d | ECE raw=%.4f→%.4f %s | NLL raw=%.4f→%.4f | Brier raw=%.4f→%.4f",
+            "[Fold %d] epoch_avg=%.2fs | params=%d | "
+            "ECE(%s,%db) raw=%.4f→%.4f | NLL raw=%.4f→%.4f | Brier raw=%.4f→%.4f | "
+            "Acc raw=%.4f→%.4f | AUROC raw=%.4f→%.4f | F1 raw=%.4f→%.4f",
             fold, train_time_s, sum(p.numel() for p in model_s.parameters()),
-            ece_raw, ece_ts, cal_suffix, nll_raw, nll_ts, br_raw, br_ts
+            args.ece_strategy, args.ece_bins,
+            ece_raw, ece_ts,
+            nll_raw, nll_ts, br_raw, br_ts,
+            acc_raw, acc_ts, auc_raw, auc_ts,
+            m_raw["f1"], m_ts["f1"]
         )
+
+
+        # ---- CV triage: choose (tau,delta) on VAL, evaluate on TEST ----
+        try:
+            yv, pr_v, pc_v, Xv = _collect_probs_on_loader(model_s, val_ld, device, args.calibration, T_fold, iso_cal)
+            budget_count = int(min(args.review_budget, len(yv)))
+            chosen_fold = select_thresholds_budget_count(y_true=yv, probs=pc_v, X=Xv, budget_count=budget_count)
+            tau_f = float(chosen_fold["tau"]); delta_f = float(chosen_fold["delta"])
+            tri_val = _selective_metrics_binary(yv, pc_v, tau=tau_f, delta=delta_f)
+            tri_te  = _selective_metrics_binary(np.asarray(y_true_ts, dtype=int),
+                                                probs_ts_all.numpy(), tau=tau_f, delta=delta_f)
+            triage_rows.append({
+                "fold": fold,
+                "budget_count_val": budget_count,
+                "tau": tau_f,
+                "delta": delta_f,
+                "val_abstain": float(chosen_fold.get("abstain", np.nan)),
+                "val_capture": float(chosen_fold.get("capture", np.nan)),
+                "val_risk_accept": float(chosen_fold.get("risk_accept", np.nan)),
+                "test_coverage": float(tri_te.get("coverage", np.nan)),
+                "test_abstain": float(tri_te.get("abstain", np.nan)),
+                "test_risk_accept": float(tri_te.get("risk_accept", np.nan)),
+                "test_capture": float(tri_te.get("capture", np.nan)),
+                "test_precision_review": float(tri_te.get("precision_review", np.nan)),
+                "test_fn_auto_rate": float(tri_te.get("fn_auto_rate", np.nan)),
+                "test_fp_auto_rate": float(tri_te.get("fp_auto_rate", np.nan)),
+            })
+        except Exception as e:
+            logging.warning("[Fold %d] triage selection/eval failed: %s", fold, e)
 
         # ========== NEW: multi-calibration block (runs in addition to RAW vs selected --calibration) ==========
         methods = [m.strip().lower() for m in args.calibs.split(",") if m.strip()]
@@ -654,7 +946,7 @@ def main():
                     auc   = float(roc_auc_score(y_np_mc, probs_np[:, 1]))
                 except Exception:
                     auc = float("nan")
-                ece   = expected_calibration_error(y_np_mc, probs_np[:, 1], n_bins=10)
+                ece   = _ece_binary(y_np_mc, probs_np[:, 1], n_bins=args.ece_bins, strategy=args.ece_strategy)
                 nll   = negative_log_likelihood(y_np_mc, probs_np[:, 1])
                 brier = brier_score(y_np_mc, probs_np[:, 1])
             else:
@@ -689,15 +981,67 @@ def main():
     per_fold_path = os.path.join(args.output_folder, "cv_metrics_per_fold.csv")
     with open(per_fold_path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["fold","ECE_raw","ECE_TS","NLL_raw","NLL_TS","Brier_raw","Brier_TS","Acc_TS","AUC_TS"])
+        w.writerow([
+            "fold",
+            f"ECE_raw({args.ece_strategy},{args.ece_bins})", f"ECE_cal({args.ece_strategy},{args.ece_bins})",
+            "NLL_raw","NLL_cal","Brier_raw","Brier_cal",
+            "Acc_raw","Acc_cal","AUROC_raw","AUROC_cal",
+            "F1_raw","F1_cal","BalAcc_raw","BalAcc_cal",
+            "AUPRC_raw","AUPRC_cal",
+            "Precision_raw","Precision_cal",
+            "Recall_raw","Recall_cal",
+            "Specificity_raw","Specificity_cal",
+        ])
         for i in range(len(ece_raw_folds)):
-            w.writerow([i + 1,
-                        f"{ece_raw_folds[i]:.6f}", f"{ece_ts_folds[i]:.6f}",
-                        f"{nll_raw_folds[i]:.6f}", f"{nll_ts_folds[i]:.6f}",
-                        f"{br_raw_folds[i]:.6f}",  f"{br_ts_folds[i]:.6f}",
-                        f"{acc_ts_folds[i]:.6f}",  f"{auc_ts_folds[i]:.6f}"])
+            w.writerow([
+                i + 1,
+                f"{ece_raw_folds[i]:.6f}", f"{ece_ts_folds[i]:.6f}",
+                f"{nll_raw_folds[i]:.6f}", f"{nll_ts_folds[i]:.6f}",
+                f"{br_raw_folds[i]:.6f}",  f"{br_ts_folds[i]:.6f}",
+                f"{acc_raw_folds[i]:.6f}", f"{acc_ts_folds[i]:.6f}",
+                f"{auc_raw_folds[i]:.6f}", f"{auc_ts_folds[i]:.6f}",
+                f"{f1_raw_folds[i]:.6f}",  f"{f1_ts_folds[i]:.6f}",
+                f"{bacc_raw_folds[i]:.6f}", f"{bacc_ts_folds[i]:.6f}",
+                f"{ap_raw_folds[i]:.6f}",  f"{ap_ts_folds[i]:.6f}",
+                f"{prec_raw_folds[i]:.6f}", f"{prec_ts_folds[i]:.6f}",
+                f"{rec_raw_folds[i]:.6f}",  f"{rec_ts_folds[i]:.6f}",
+                f"{spec_raw_folds[i]:.6f}", f"{spec_ts_folds[i]:.6f}",
+            ])
 
     logger.info("Saved per-fold CV metrics to %s", per_fold_path)
+
+
+    # Save fold manifest + basic class counts
+    _safe_write_json(os.path.join(args.output_folder, "cv_folds.json"), {"folds": fold_manifest})
+    counts_path = os.path.join(args.output_folder, "cv_fold_counts.csv")
+    with open(counts_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(fold_counts[0].keys()) if fold_counts else [])
+        if fold_counts:
+            w.writeheader()
+            w.writerows(fold_counts)
+    logger.info("Saved CV fold class counts to %s", counts_path)
+
+    # Save CV triage per-fold (if computed)
+    if triage_rows:
+        tri_path = os.path.join(args.output_folder, "cv_triage_per_fold.csv")
+        with open(tri_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(triage_rows[0].keys()))
+            w.writeheader()
+            w.writerows(triage_rows)
+        logger.info("Saved CV triage per-fold to %s", tri_path)
+
+        # Summary (t-CI) for key triage metrics
+        def _summ(metric: str) -> Tuple[float, float]:
+            return _mean_ci_t([r.get(metric, float("nan")) for r in triage_rows])
+        tri_sum_path = os.path.join(args.output_folder, "cv_triage_summary.csv")
+        with open(tri_sum_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["Metric","Mean","CI95"])
+            for metric in ["test_coverage","test_abstain","test_risk_accept","test_capture",
+                           "test_precision_review","test_fn_auto_rate","test_fp_auto_rate"]:
+                m, ci = _summ(metric)
+                w.writerow([metric, f"{m:.6f}", f"{ci:.6f}"])
+        logger.info("Saved CV triage summary to %s", tri_sum_path)
 
     save_overall_history(histories_all_folds, args.output_folder)
 
@@ -709,8 +1053,8 @@ def main():
 
     def _row(name, raw_list, ts_list):
         """Helper: summary row with mean, 95% CI half-width, and relative drop from RAW to TS."""
-        m_raw, ci_raw = mean_ci(raw_list)
-        m_ts,  ci_ts  = mean_ci(ts_list)
+        m_raw, ci_raw = _mean_ci_t(raw_list)
+        m_ts,  ci_ts  = _mean_ci_t(ts_list)
         rel_drop = (m_raw - m_ts) / max(m_raw, 1e-12)
         return [name, m_raw, ci_raw, m_ts, ci_ts, rel_drop]
 
@@ -741,7 +1085,11 @@ def main():
                 if a.size == 0:
                     return (float("nan"), float("nan"))
                 mean = float(a.mean())
-                hw = 1.96 * float(a.std(ddof=1)) / max(len(a), 1)**0.5 if len(a) > 1 else 0.0
+                if a.size == 1:
+                    return (mean, 0.0)
+                sd = float(a.std(ddof=1))
+                tcrit = float(stats.t.ppf(0.975, df=a.size - 1))
+                hw = tcrit * sd / (a.size ** 0.5)
                 return (mean, hw)
             for name in ["ECE","NLL","Brier","Acc","AUC"]:
                 mean, hw = _ci95(sub[name])
@@ -763,18 +1111,43 @@ def main():
         y_full, args.output_folder
     )
     
-    # Retrain on full dataset with proper train/val/test split
-    logger.info("Retraining on full dataset…")
-    X_full, y_full = load_mitbih_data(args.data_folder, record_names, WINDOW_SIZE, PRE_SAMPLES, FS)
-    X_full_c = prepare_complex_input(X_full, method='complex_stats')
+    # Retrain on full dataset with patient-wise (record-level) train/val/test split (no leakage)
+    # (paper protocol emphasizes patient-wise split)  :contentReference[oaicite:3]{index=3}
+    logger.info("Retraining FULL model with patient-wise record split…")
+    if args.full_test_fold == args.full_val_fold:
+        raise ValueError("full_test_fold and full_val_fold must be different.")
+    if not (1 <= args.full_test_fold <= args.folds and 1 <= args.full_val_fold <= args.folds):
+        raise ValueError("full_test_fold/full_val_fold must be within 1..folds.")
 
-    # First split: TrainVal/Test (80/20)
-    X_trv, X_te, y_trv, y_te = train_test_split(
-        X_full_c, y_full, test_size=0.2, stratify=y_full, random_state=args.seed + 1
-    )
-    X_tr, X_va, y_tr, y_va = train_test_split(
-        X_trv, y_trv, test_size=0.125, stratify=y_trv, random_state=args.seed + 2
-    )
+    # Build K partitions of record indices (test_idx of each fold)
+    parts = []
+    for _, te_idx in kf.split(record_names):
+        parts.append(list(te_idx))
+    te_set = set(parts[args.full_test_fold - 1])
+    va_set = set(parts[args.full_val_fold - 1])
+    tr_set = set(range(len(record_names))) - te_set - va_set
+
+    train_recs_full = [record_names[i] for i in sorted(tr_set)]
+    val_recs_full   = [record_names[i] for i in sorted(va_set)]
+    test_recs_full  = [record_names[i] for i in sorted(te_set)]
+
+    _safe_write_json(os.path.join(args.output_folder, "full_split_records.json"), {
+        "folds": args.folds,
+        "seed": args.seed,
+        "full_test_fold": args.full_test_fold,
+        "full_val_fold": args.full_val_fold,
+        "train_records": train_recs_full,
+        "val_records": val_recs_full,
+        "test_records": test_recs_full,
+    })
+
+    X_tr_raw, y_tr = load_mitbih_data(args.data_folder, train_recs_full, WINDOW_SIZE, PRE_SAMPLES, FS)
+    X_va_raw, y_va = load_mitbih_data(args.data_folder, val_recs_full,   WINDOW_SIZE, PRE_SAMPLES, FS)
+    X_te_raw, y_te = load_mitbih_data(args.data_folder, test_recs_full,  WINDOW_SIZE, PRE_SAMPLES, FS)
+
+    X_tr = prepare_complex_input(X_tr_raw, method='complex_stats')
+    X_va = prepare_complex_input(X_va_raw, method='complex_stats')
+    X_te = prepare_complex_input(X_te_raw, method='complex_stats')
     
     tr_all, va_all, te_all, scaler_full = create_train_val_test_loaders(
         X_tr, y_tr, X_va, y_va, X_te, y_te,
@@ -810,24 +1183,7 @@ def main():
         logger.info("[INFO] No calibration ('none') on full model.")
 
     # Collect calibrated probabilities on VALIDATION (needed to pick tau*, delta*)
-    yva, pva, Xva = [], [], []
-    model_all.eval()
-    with torch.no_grad():
-        for xb, yb in va_all:
-            logits = complex_modulus_to_logits(model_all(xb.to(device)))
-            probs_raw = nn.Softmax(dim=1)(logits)
-            if args.calibration == "temperature" and T_full is not None:
-                probs = nn.Softmax(dim=1)(logits / T_full.to(device))
-            elif args.calibration == "isotonic" and iso_full is not None:
-                probs = torch.from_numpy(iso_full(probs_raw.cpu().numpy()))
-            else:
-                probs = probs_raw
-            yva.extend(yb.numpy().tolist())
-            pva.extend(probs.cpu().numpy().tolist())
-            Xva.extend(xb.cpu().numpy().tolist())
-
-
-    yva = np.array(yva); pva = np.array(pva); Xva = np.array(Xva)
+    yva, pva_raw, pva, Xva = _collect_probs_on_loader(model_all, va_all, device, args.calibration, T_full, iso_full)
 
     kink_star = float('nan')  # set later if grid was computed
     if args.sensitivity:
@@ -1028,24 +1384,9 @@ def main():
 
 
     # --- Uncertainty histogram on TEST set (uses tau_star picked on VAL) ---
-    y_conf_test = []
-    y_margin_test = []   # NEW
-    model_all.eval()
-    with torch.no_grad():
-        for xb, yb in te_all:
-            logits = complex_modulus_to_logits(model_all(xb.to(device)))
-            probs_raw = nn.Softmax(dim=1)(logits)
-            if args.calibration == "temperature" and T_full is not None:
-                probs = nn.Softmax(dim=1)(logits / T_full.to(device))
-            elif args.calibration == "isotonic" and iso_full is not None:
-                probs = torch.from_numpy(iso_full(probs_raw.cpu().numpy()))
-            else:
-                probs = probs_raw
-
-            y_conf_test.extend(probs.max(dim=1).values.cpu().tolist())
-
-            top2 = torch.topk(probs, k=2, dim=1).values
-            y_margin_test.extend((top2[:, 0] - top2[:, 1]).abs().cpu().tolist())
+    yte, pte_raw, pte, Xte = _collect_probs_on_loader(model_all, te_all, device, args.calibration, T_full, iso_full)
+    y_conf_test = pte.max(axis=1).tolist()
+    y_margin_test = np.abs(pte[:, 1] - pte[:, 0]).tolist()
 
     label = None
     if tau_star <= 1e-9:
@@ -1066,35 +1407,56 @@ def main():
     plt.close(fig)
     logging.info("Saved uncertainty margin histogram")
 
-    # --- Detect uncertain points on TEST (using the chosen tau_star & delta_star) ---
-    X_te_scaled_t, y_te_t = te_all.dataset.tensors
-    X_te_scaled_t = X_te_scaled_t.cpu()
-    y_te_t        = y_te_t.cpu()
-    temp_arg = T_full if (args.calibration == "temperature" and T_full is not None) else None
-    uncertain_full = find_uncertain_points(
-        model_all.to('cpu'),
-        X_te_scaled_t,
-        y_te_t,
-        prob_thr=float(tau_star),
-        margin_delta=float(delta_star),
-        temperature=temp_arg
-    )
 
-    logger.info(f"[FULL] Uncertain flagged on TEST: {len(uncertain_full)} samples.")
+    # --- Save full-model predictions (VAL/TEST) for stage 2.4 and the paper appendix ---
+    if args.save_full_predictions:
+        def _dump_pred_csv(path: str, y: np.ndarray, pr: np.ndarray, pc: np.ndarray):
+            with open(path, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow([
+                    "row","true",
+                    "pred_RAW","p0_RAW","p1_RAW","pmax_RAW","margin_RAW",
+                    "pred_CAL","p0_CAL","p1_CAL","pmax_CAL","margin_CAL",
+                ])
+                for i in range(len(y)):
+                    p0r, p1r = float(pr[i,0]), float(pr[i,1])
+                    p0c, p1c = float(pc[i,0]), float(pc[i,1])
+                    w.writerow([
+                        i, int(y[i]),
+                        int(np.argmax(pr[i])), p0r, p1r, float(max(p0r,p1r)), float(abs(p1r-p0r)),
+                        int(np.argmax(pc[i])), p0c, p1c, float(max(p0c,p1c)), float(abs(p1c-p0c)),
+                    ])
+        _dump_pred_csv(os.path.join(args.output_folder, "predictions_full_val.csv"), yva, pva_raw, pva)
+        _dump_pred_csv(os.path.join(args.output_folder, "predictions_full_test.csv"), yte, pte_raw, pte)
+        logging.info("Saved full-model prediction CSVs (VAL/TEST).")
+
+    # --- Detect uncertain points on TEST using the chosen (tau*, delta*) on calibrated probs ---
+    pmax = pte.max(axis=1)
+    margin = np.abs(pte[:, 1] - pte[:, 0])
+    mask_uncertain = (pmax <= float(tau_star) + 1e-12) | (margin <= float(delta_star) + 1e-12)
+    idxs = np.where(mask_uncertain)[0].tolist()
+    logger.info(f"[FULL] Uncertain flagged on TEST: {len(idxs)} samples.")
 
     # --- Save uncertain points CSV ---
+    # NOTE: post_processing_real expects at least: index, X, true_label, p1, p2  :contentReference[oaicite:4]{index=4}
+    csv_path = os.path.join(args.output_folder, 'uncertain_full.csv')
     csv_path = os.path.join(args.output_folder, 'uncertain_full.csv')
     with open(csv_path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=['index','X','true_label','p1','p2'])
+        writer = csv.DictWriter(f, fieldnames=['index','X','true_label','pred','p1','p2','pmax','margin'])
         writer.writeheader()
-        for u in uncertain_full:
-            p1, p2 = u['prob']
+        # X must be in model-input space (already scaled in te_all.dataset.tensors)
+        X_te_scaled_t, y_te_t = te_all.dataset.tensors
+        X_te_scaled_t = X_te_scaled_t.cpu().numpy()
+        for i in idxs:
             writer.writerow({
-                'index':      u['index'],
-                'X':          u['X'],
-                'true_label': u['true_label'],
-                'p1':         p1,
-                'p2':         p2
+                "index": int(i),
+                "X": X_te_scaled_t[i].tolist(),
+                "true_label": int(yte[i]),
+                "pred": int(np.argmax(pte[i])),
+                "p1": float(pte[i,0]),
+                "p2": float(pte[i,1]),
+                "pmax": float(pmax[i]),
+                "margin": float(margin[i]),
             })
 
 

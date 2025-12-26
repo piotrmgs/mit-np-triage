@@ -244,62 +244,105 @@ def benchmark_local_poly_approx_and_puiseux(
 # ---------------------------------------------------------------------
 # 2) Approximation quality (fast version via lambdify)
 # ---------------------------------------------------------------------
-def evaluate_poly_approx_quality(model,
-                                 poly_expr,
-                                 xstar,
-                                 delta=0.01,
-                                 n_samples=500,
-                                 device='cpu'):
+def evaluate_poly_approx_quality(
+    model,
+    poly_expr,
+    xstar,
+    delta=0.01,
+    n_samples=500,
+    device='cpu',
+    *,
+    calibrator=None,
+    fit_diag: dict = None,
+    include_linear_and_const: bool = True,
+):
     """
-    Evaluate the quality of polynomial approximation (`poly_expr`) against
-    the true function f(x) = alpha_0(x) - alpha_1(x) locally around `xstar`.
+    Evaluate local surrogate `poly_expr` against the *decision score*:
+        score(x) = (logits_eff[1] - logits_eff[0]),
+    where logits_eff = calibrator.apply_to_logits(logits_raw) if calibrator is not None.
 
-    Returns
-    -------
-    dict
-        {'RMSE', 'MAE', 'corr_pearson', 'sign_agreement'}.
+    IMPORTANT:
+    - poly_expr is expected to be Puiseux-ready (no constant + no linear terms).
+    - If include_linear_and_const=True and fit_diag contains:
+          score0, lin_cx_re/lin_cx_im, lin_cy_re/lin_cy_im
+      then we reconstruct the full surrogate:
+          score_hat = score0 + Re( cx*z1 + cy*z2 + poly_expr(z1,z2) )
     """
     x_sym, y_sym = sympy.symbols('x y')
     f_num = sympy.lambdify((x_sym, y_sym), poly_expr, modules=["numpy"])
 
+    xstar = np.asarray(xstar, dtype=np.float32)
+
     z1_star = xstar[0] + 1j * xstar[2]
     z2_star = xstar[1] + 1j * xstar[3]
 
-    shifts = (2 * delta) * np.random.rand(n_samples, 4) - delta
-    fvals_list, pvals_list = [], []
+    # pull linear+const info from diag (if available)
+    score0 = 0.0
+    cx = 0.0 + 0.0j
+    cy = 0.0 + 0.0j
+    if include_linear_and_const and isinstance(fit_diag, dict):
+        try:
+            score0 = float(fit_diag.get("score0", 0.0))
+        except Exception:
+            score0 = 0.0
+        try:
+            cx = complex(float(fit_diag.get("lin_cx_re", 0.0)), float(fit_diag.get("lin_cx_im", 0.0)))
+            cy = complex(float(fit_diag.get("lin_cy_re", 0.0)), float(fit_diag.get("lin_cy_im", 0.0)))
+        except Exception:
+            cx = 0.0 + 0.0j
+            cy = 0.0 + 0.0j
+
+    shifts = (2 * delta) * np.random.rand(n_samples, 4).astype(np.float32) - delta
+    score_true_list, score_hat_list = [], []
 
     for shift in shifts:
         x_loc = xstar + shift
-        # 1) f(x)
+
+        # 1) true score(x) from model (optionally calibrated)
         x_ten = torch.tensor(x_loc, dtype=torch.float32, device=device).unsqueeze(0)
         with torch.no_grad():
-            out = model(x_ten)
-            half = out.shape[1] // 2
-            xr, xi = out[:, :half], out[:, half:]
-            alpha = torch.sqrt(xr**2 + xi**2 + 1e-9)
-            f_val = (alpha[:, 0] - alpha[:, 1]).item()
-        fvals_list.append(f_val)
+            logits_raw = complex_modulus_to_logits(model(x_ten))  # (1,2)
+            if calibrator is not None:
+                try:
+                    logits_eff = calibrator.apply_to_logits(logits_raw)
+                except Exception:
+                    logits_eff = logits_raw
+            else:
+                logits_eff = logits_raw
+            score_true = float((logits_eff[0, 1] - logits_eff[0, 0]).item())
+        score_true_list.append(score_true)
 
-        # 2) p(x) — local shift then lambdify evaluation
+        # 2) surrogate score_hat(x)
         z1 = (x_loc[0] + 1j * x_loc[2]) - z1_star
         z2 = (x_loc[1] + 1j * x_loc[3]) - z2_star
-        p_val = f_num(z1, z2)
-        pvals_list.append(np.real(p_val))
 
-    fvals_arr = np.array(fvals_list)
-    pvals_arr = np.array(pvals_list)
+        p_nl = f_num(z1, z2)  # complex
+        p_hat = np.real(p_nl)
 
-    rmse = np.sqrt(np.mean((pvals_arr - fvals_arr) ** 2))
-    mae = np.mean(np.abs(pvals_arr - fvals_arr))
-    corr = (np.corrcoef(fvals_arr, pvals_arr)[0, 1]
-            if np.std(pvals_arr) * np.std(fvals_arr) > 1e-12 else 0.0)
-    sign_agreement = np.mean((fvals_arr > 0) == (pvals_arr > 0))
+        if include_linear_and_const:
+            # reconstruct full score_hat = score0 + Re(cx*z1 + cy*z2) + Re(poly_nl)
+            p_hat = float(score0 + np.real(cx * z1 + cy * z2) + p_hat)
+
+        score_hat_list.append(float(p_hat))
+
+    score_true_arr = np.asarray(score_true_list, dtype=float)
+    score_hat_arr = np.asarray(score_hat_list, dtype=float)
+
+    rmse = float(np.sqrt(np.mean((score_hat_arr - score_true_arr) ** 2)))
+    mae = float(np.mean(np.abs(score_hat_arr - score_true_arr)))
+
+    if np.std(score_hat_arr) * np.std(score_true_arr) > 1e-12:
+        corr = float(np.corrcoef(score_true_arr, score_hat_arr)[0, 1])
+    else:
+        corr = 0.0
+
+    sign_agreement = float(np.mean((score_true_arr > 0) == (score_hat_arr > 0)))
 
     return {
-        'RMSE': float(rmse),
-        'MAE': float(mae),
-        'corr_pearson': float(corr),
-        'sign_agreement': float(sign_agreement),
+        'RMSE': rmse,
+        'MAE': mae,
+        'corr_pearson': corr,
+        'sign_agreement': sign_agreement,
     }
 
 
@@ -513,65 +556,66 @@ def local_poly_approx_complex(
     min_keep_ratio=0.25,
     max_retries=1,
     ridge=1e-8,
+    *,
+    calibrator=None,
+    puiseux_tol=1e-10,
 ):
     """
-    Build a local polynomial F = (|c1| - |c2|) around `xstar` in C^2.
+    Build a Puiseux-ready local polynomial around xstar in C^2.
 
-    Robustness tricks:
-    - `exclude_kink_eps`: drop samples near modReLU kinks in fc1 (|z| + b <= eps).
-    - `weight_by_distance`: row weights ~ min(shifted) so samples farther from kinks get more weight.
-    - `retry`: if too few clean samples, re-sample in a smaller cube and augment.
-    - degree fallback: iteratively decrease the degree until rank/conditioning are stable.
+    We fit the *decision score* (optionally calibrated):
+        score(x) = logits_eff[1] - logits_eff[0]
+    where logits_eff = calibrator.apply_to_logits(logits_raw) if calibrator is not None.
 
-    Parameters
-    ----------
-    model : torch.nn.Module
-    xstar : array-like (4,)
-        Base point in R^4.
-    delta : float
-        Side half-length of the initial sampling cube.
-    degree : int
-        Initial max total degree; may be reduced if the system is unstable.
-    n_samples : int
-        Number of initial perturbations.
-    device : {"cpu","cuda"} or torch.device
-    remove_linear : bool
-        Remove constant/linear monomials from the basis (focus on non-linear terms).
-    exclude_kink_eps : float
-        Threshold for detecting and excluding kink-near samples.
-    weight_by_distance : bool
-        If True, use min(shifted) as WLS weights (favoring points farther from kinks).
-    return_diag : bool
-        If True, return (expr, diagnostics_dict); otherwise return expr only.
-    min_keep_ratio : float
-        Minimum fraction of kept samples; otherwise perform a retry in a smaller cube.
-    max_retries : int
-        Number of retries with a smaller cube if keep ratio is too low.
-    ridge : float
-        Tikhonov regularization strength for LSQ.
+    To satisfy Newton–Puiseux preconditions, we RETURN a polynomial with:
+      - constant term removed (P(0,0)=0),
+      - linear terms removed (if remove_linear=True).
 
-    Returns
-    -------
-    sympy.Expr or (sympy.Expr, dict)
-        Local polynomial (shifted so that P(0,0)=0) and diagnostics if requested.
+    However, for fidelity we FIT the full polynomial INCLUDING constant+linear.
+    The removed parts are stored in diag:
+      - score0, lin_cx_re/lin_cx_im, lin_cy_re/lin_cy_im
+    so the caller can reconstruct the full surrogate if needed.
     """
     t0 = time.time()
     model.eval()
     xstar = np.asarray(xstar, dtype=np.float32)
     x_sym, y_sym = sympy.symbols('x y')
 
+    # score at anchor (needed to center samples so constant≈0)
+    score0 = 0.0
+    try:
+        x0_t = torch.tensor(xstar.reshape(1, 4), dtype=torch.float32, device=device)
+        with torch.no_grad():
+            logits0_raw = complex_modulus_to_logits(model(x0_t))
+            if calibrator is not None:
+                try:
+                    logits0_eff = calibrator.apply_to_logits(logits0_raw)
+                except Exception:
+                    logits0_eff = logits0_raw
+            else:
+                logits0_eff = logits0_raw
+            score0 = float((logits0_eff[0, 1] - logits0_eff[0, 0]).item())
+    except Exception:
+        score0 = 0.0
+
     # 1) Sample perturbations around xstar
     shifts = (2 * delta) * np.random.rand(n_samples, 4).astype(np.float32) - delta
     X_loc = xstar.reshape(1, 4) + shifts
     X_t = torch.tensor(X_loc, dtype=torch.float32, device=device)
 
-    # 2) Forward pass: compute F and kink mask in fc1
+    # 2) Forward pass: compute score centered at anchor + kink mask in fc1
     with torch.no_grad():
-        out = model(X_t)  # [N, 2*out_features]
-        half = out.shape[1] // 2
-        xr, xi = out[:, :half], out[:, half:]
-        alpha = torch.sqrt(torch.clamp(xr**2 + xi**2, min=1e-9))
-        Fvals = (alpha[:, 0] - alpha[:, 1]).cpu().numpy()
+        logits_raw = complex_modulus_to_logits(model(X_t))  # (N,2)
+        if calibrator is not None:
+            try:
+                logits_eff = calibrator.apply_to_logits(logits_raw)
+            except Exception:
+                logits_eff = logits_raw
+        else:
+            logits_eff = logits_raw
+
+        score = (logits_eff[:, 1] - logits_eff[:, 0]).detach().cpu().numpy().astype(np.float64)
+        Fvals = (score - float(score0))
 
         H = model.fc1(X_t)  # [N, 2*hidden]
         hhalf = H.size(1) // 2
@@ -580,7 +624,7 @@ def local_poly_approx_complex(
         bias = getattr(model, "bias_modrelu", 0.0)
         if not isinstance(bias, torch.Tensor):
             bias = torch.tensor(bias, device=mag.device)
-        shifted = mag + bias  # kink if <= 0
+        shifted = mag + bias  # kink if <= eps
 
     time_sampling = time.time() - t0
 
@@ -620,11 +664,19 @@ def local_poly_approx_complex(
             hr2, hi2 = H2[:, :hhalf2], H2[:, hhalf2:]
             mag2 = torch.sqrt(torch.clamp(hr2**2 + hi2**2, min=1e-12))
             shifted2 = mag2 + bias
-            out2 = model(X_t2)
-            half2 = out2.shape[1] // 2
-            xr2, xi2 = out2[:, :half2], out2[:, half2:]
-            alpha2 = torch.sqrt(torch.clamp(xr2**2 + xi2**2, min=1e-9))
-            Fvals2 = (alpha2[:, 0] - alpha2[:, 1]).cpu().numpy()
+
+            logits2_raw = complex_modulus_to_logits(model(X_t2))
+            if calibrator is not None:
+                try:
+                    logits2_eff = calibrator.apply_to_logits(logits2_raw)
+                except Exception:
+                    logits2_eff = logits2_raw
+            else:
+                logits2_eff = logits2_raw
+
+            score2 = (logits2_eff[:, 1] - logits2_eff[:, 0]).detach().cpu().numpy().astype(np.float64)
+            Fvals2 = (score2 - float(score0))
+
         mask2 = (shifted2 <= kink_eps).any(dim=1).cpu().numpy()
         keep2 = ~mask2
         for p, f, m in zip(X_loc2, Fvals2, keep2):
@@ -632,36 +684,91 @@ def local_poly_approx_complex(
                 z1 = (p[0] + 1j * p[2]) - z1_star
                 z2 = (p[1] + 1j * p[3]) - z2_star
                 z_kept.append((z1, z2))
-                F_kept.append(f)
+                F_kept.append(float(f))
+
         if weight_by_distance:
             min_shift2 = shifted2.min(dim=1).values.cpu().numpy()
             w_kept += [w for w, m in zip(np.maximum(min_shift2, 0.0) + 1e-9, keep2) if m]
 
     kept_ratio = float(len(F_kept) / max(n_samples, 1))
 
-    # 5) Fit (WLS + ridge) with degree fallback until stable rank/conditioning
+    # 5) Fit (WLS + ridge) INCLUDING constant+linear (remove_linear=False for fitting)
     t1 = time.time()
-    expr = None
+    expr_full = None
     info = {}
     used_degree = int(degree)
-    # Try from 'degree' down to 2
+
     for d in range(int(degree), 1, -1):
         _, expr_try, info_try = fit_polynomial_complex(
-            z_kept, F_kept, degree=d, remove_linear=remove_linear, weights=w_kept, ridge=ridge
+            z_kept, F_kept, degree=d, remove_linear=False, weights=w_kept, ridge=ridge
         )
         stable = (info_try.get("rank", 0) == info_try.get("n_monos", 0)) and (info_try.get("cond", np.inf) < 1e10)
-        # Initialize or accept stable solution
-        if expr is None:
-            expr, info, used_degree = expr_try, info_try, d
+        if expr_full is None:
+            expr_full, info, used_degree = expr_try, info_try, d
         if stable:
-            expr, info, used_degree = expr_try, info_try, d
+            expr_full, info, used_degree = expr_try, info_try, d
             break
-        # If still unstable — keep the better-conditioned candidate
         if info_try.get("cond", np.inf) < info.get("cond", np.inf):
-            expr, info, used_degree = expr_try, info_try, d
+            expr_full, info, used_degree = expr_try, info_try, d
 
-    # Enforce P(0,0)=0 (shift constant term)
-    expr = sympy.simplify(expr - expr.subs({x_sym: 0, y_sym: 0}))
+    # enforce constant=0 (should be close already, because Fvals are centered)
+    expr_full = sympy.expand(sympy.simplify(expr_full - expr_full.subs({x_sym: 0, y_sym: 0})))
+
+    # extract constant + linear (for diag + reconstruction)
+    lin_c0 = 0
+    lin_cx = 0
+    lin_cy = 0
+    try:
+        P = sympy.Poly(expr_full, x_sym, y_sym)
+        lin_c0 = P.coeff_monomial(1)
+        lin_cx = P.coeff_monomial(x_sym)
+        lin_cy = P.coeff_monomial(y_sym)
+    except Exception:
+        lin_c0 = 0
+        lin_cx = 0
+        lin_cy = 0
+
+    def _cparts(z):
+        try:
+            zz = complex(sympy.N(z))
+            return float(np.real(zz)), float(np.imag(zz))
+        except Exception:
+            try:
+                return float(z), 0.0
+            except Exception:
+                return float("nan"), float("nan")
+
+    c0_re, c0_im = _cparts(lin_c0)
+    cx_re, cx_im = _cparts(lin_cx)
+    cy_re, cy_im = _cparts(lin_cy)
+
+    # return Puiseux-ready (no const, no linear) if requested
+    expr_ret = expr_full
+    if remove_linear:
+        expr_ret = sympy.expand(expr_full - lin_c0 - lin_cx * x_sym - lin_cy * y_sym)
+
+        # final safety: remove tiny residual linear leakage numerically
+        try:
+            P2 = sympy.Poly(expr_ret, x_sym, y_sym)
+            c0_2 = P2.coeff_monomial(1)
+            cx_2 = P2.coeff_monomial(x_sym)
+            cy_2 = P2.coeff_monomial(y_sym)
+
+            def _absz(z):
+                try:
+                    return float(abs(complex(sympy.N(z))))
+                except Exception:
+                    return float("nan")
+
+            if np.isfinite(_absz(c0_2)) and _absz(c0_2) > puiseux_tol:
+                expr_ret = sympy.expand(expr_ret - c0_2)
+            if np.isfinite(_absz(cx_2)) and _absz(cx_2) > puiseux_tol:
+                expr_ret = sympy.expand(expr_ret - cx_2 * x_sym)
+            if np.isfinite(_absz(cy_2)) and _absz(cy_2) > puiseux_tol:
+                expr_ret = sympy.expand(expr_ret - cy_2 * y_sym)
+        except Exception:
+            pass
+
     time_fit = time.time() - t1
 
     diag = {
@@ -676,13 +783,21 @@ def local_poly_approx_complex(
         "kink_eps": float(kink_eps),
         "degree_used": int(used_degree),
         "retry": int(attempt),
-        # Residual diagnostics from LSQ
         "resid_mean": info.get("resid_mean", float("nan")),
         "resid_std": info.get("resid_std", float("nan")),
         "resid_skew": info.get("resid_skew", float("nan")),
         "resid_kurt": info.get("resid_kurt", float("nan")),
+
+        # NEW: calibration-aware centering + linear terms for reconstruction
+        "score0": float(score0),
+        "lin_c0_re": float(c0_re), "lin_c0_im": float(c0_im),
+        "lin_cx_re": float(cx_re), "lin_cx_im": float(cx_im),
+        "lin_cy_re": float(cy_re), "lin_cy_im": float(cy_im),
+        "remove_linear_requested": bool(remove_linear),
     }
-    return (expr, diag) if return_diag else expr
+
+    return (expr_ret, diag) if return_diag else expr_ret
+
 
 
 # ---------------------------------------------------------------------

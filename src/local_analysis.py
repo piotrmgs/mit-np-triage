@@ -690,7 +690,9 @@ def local_poly_approx_complex(
             min_shift2 = shifted2.min(dim=1).values.cpu().numpy()
             w_kept += [w for w, m in zip(np.maximum(min_shift2, 0.0) + 1e-9, keep2) if m]
 
-    kept_ratio = float(len(F_kept) / max(n_samples, 1))
+    n_total_used = int(n_samples + attempt * n_samples)  # jeśli retry dodaje kolejne n_samples
+    kept_ratio = float(len(F_kept) / max(n_total_used, 1))
+
 
     # 5) Fit (WLS + ridge) INCLUDING constant+linear (remove_linear=False for fitting)
     t1 = time.time()
@@ -774,7 +776,7 @@ def local_poly_approx_complex(
     diag = {
         "time_sampling": float(time_sampling),
         "time_fit": float(time_fit),
-        "n_total": int(n_samples),
+        "n_total": int(n_total_used),
         "n_kept": int(len(F_kept)),
         "kept_ratio": kept_ratio,
         "cond": info.get("cond", float("nan")),

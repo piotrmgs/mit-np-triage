@@ -630,6 +630,17 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--batch_size", type=int, default=128)
+
+    # Model hyperparameter: modReLU bias (critical for nonlinearity / kink prevalence)
+    parser.add_argument(
+        "--modrelu_bias",
+        type=float,
+        default=0.1,
+        help="Bias term used in modReLU activation (SimpleComplexNet). "
+             "Positive => always-active regime; negative => introduces inactive/kink regions.",
+    )
+
+
     parser.add_argument("--folds", type=int, default=10)
     # NOTE: kept for backwards compatibility; predictions use argmax for binary.
     # (We log a warning if threshold != 0.5 to avoid confusion in paper appendices.)
@@ -2028,7 +2039,7 @@ def main():
             in_features=X_tr_s.shape[1] // 2,
             hidden_features=64,
             out_features=2,
-            bias=0.1,
+            bias=float(args.modrelu_bias),
         )
         model_s = model_s.to(device)
         t0 = time.perf_counter()
@@ -3276,7 +3287,7 @@ def main():
 
 
     model_all = SimpleComplexNet(
-        in_features=X_tr.shape[1] // 2, hidden_features=64, out_features=2, bias=0.1
+        in_features=X_tr.shape[1] // 2, hidden_features=64, out_features=2, bias=float(args.modrelu_bias)
     )
     model_all = model_all.to(device)
     hist_all, best_all = train_real(model_all, tr_all, va_all, epochs=args.epochs, lr=args.lr, device=device)
@@ -3689,6 +3700,48 @@ def main():
                     indent=2
                 )
             logger.info("[FULL] Saved index→record map -> %s", map_path)
+
+            # Convenience export: row-wise TEST table (join-friendly: record/window/index + probs + features).
+            # Redundant with full_test_arrays.npz, but dramatically easier to consume in downstream triage / paper scripts.
+            try:
+                rec_list: List[int] = []
+                win_list: List[int] = []
+                prev_end = 0
+                for rec, end in zip(test_rec_order, test_cum_ends):
+                    n = int(end - prev_end)
+                    rec_list.extend([int(rec)] * n)
+                    win_list.extend(list(range(n)))
+                    prev_end = end
+                if len(rec_list) != int(X_te_np.shape[0]):
+                    raise RuntimeError(f"Record/window map length mismatch: {len(rec_list)} != {int(X_te_np.shape[0])}")
+
+                full_test_df = pd.DataFrame(
+                    {
+                        "run_id": str(run_id),
+                        "seed": int(args.seed),
+                        "calibration": str(args.calibration),
+                        "index": np.arange(int(X_te_np.shape[0]), dtype=int),
+                        "record": rec_list,
+                        "window_in_record": win_list,
+                        "true_label": y_te_np.astype(int),
+                        "pred": y_pred_test.astype(int),
+                        "is_error": (y_pred_test != y_te_np).astype(int),
+                        "p1": probs_te_np[:, 0],
+                        "p2": probs_te_np[:, 1],
+                        "pmax": y_conf_test,
+                        "margin": y_margin_test,
+                        "x0": X_te_np[:, 0],
+                        "x1": X_te_np[:, 1],
+                        "x2": X_te_np[:, 2],
+                        "x3": X_te_np[:, 3],
+                    }
+                )
+                out_csv = os.path.join(args.output_folder, "full_test_predictions_ext.csv")
+                full_test_df.to_csv(out_csv, index=False)
+                logger.info("[FULL] Wrote %s", out_csv)
+            except Exception as e:
+                logger.warning("[FULL] Could not write full_test_predictions_ext.csv: %s", e)
+
         else:
             logger.warning(
                 "[FULL] index→record map not saved: sum(n_windows on test records)=%d != N_test=%d",
@@ -3875,7 +3928,7 @@ def main():
             fieldnames = [
                 "run_id","seed","calibration","tau_star","delta_star",
                 "record","window_in_record",
-                "index","true_label","pred","p1","p2","pmax","margin","reason"
+                "index","true_label","pred","is_error","p1","p2","pmax","margin","reason"
             ]
             w = csv.DictWriter(f, fieldnames=fieldnames)
             w.writeheader()
@@ -3901,6 +3954,7 @@ def main():
                     "index": idx,
                     "true_label": int(y_true_test[idx]),
                     "pred": pred,
+                    "is_error": int(pred != int(y_true_test[idx])),
                     "p1": p1, "p2": p2,
                     "pmax": pmax,
                     "margin": marg,
@@ -3916,6 +3970,176 @@ def main():
         logger.info("Saved extended uncertain CSV -> %s", ext_path)
     except Exception as _e:
         logger.warning("Failed to write uncertain_full_ext.csv: %s", _e)
+
+    # --- NEW: export FULL TEST predictions (all samples) for paper / post-processing on non-uncertain subsets ---
+    # This enables analyses like: "high-confidence PVC predictions that are still fragile / error-prone".
+    try:
+        full_pred_path = os.path.join(args.output_folder, "full_test_predictions_ext.csv")
+        fieldnames = [
+            "run_id","seed","calibration","tau_star","delta_star",
+            "index","record","window_in_record",
+            "true_label","pred","is_error",
+            "p1","p2","pmax","margin",
+            "accepted","review_reason",
+            "x0","x1","x2","x3","X",
+        ]
+        rec_stats = {}
+
+        with open(full_pred_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+
+            for idx in range(len(y_true_test)):
+                idx = int(idx)
+                p1 = float(probs_te_np[idx, 0]); p2 = float(probs_te_np[idx, 1])
+                pmax = float(y_conf_test[idx]); marg = float(y_margin_test[idx])
+                pred = int(y_pred_test[idx])
+                true = int(y_true_test[idx])
+                is_err = int(pred != true)
+                accepted = bool(accept_mask[idx])
+
+                # record mapping (requires deterministic concatenation order saved in full_test_index_map.json)
+                rec = ""
+                win_in_rec = ""
+                if test_rec_order is not None and test_cum_ends is not None:
+                    j = int(bisect.bisect_right(test_cum_ends, idx))
+                    if 0 <= j < len(test_rec_order):
+                        rec = str(test_rec_order[j])
+                        start = int(test_cum_ends[j-1]) if j > 0 else 0
+                        win_in_rec = int(idx - start)
+
+                rr = []
+                if not accepted:
+                    if pmax < float(tau_eff): rr.append("pmax")
+                    if marg < float(delta_eff): rr.append("margin")
+                review_reason = "+".join(rr) if rr else ""
+
+                x0, x1, x2, x3 = [float(v) for v in X_te_np[idx].reshape(-1).tolist()]
+
+                w.writerow({
+                    "run_id": str(getattr(args, "run_id", "")),
+                    "seed": int(args.seed),
+                    "calibration": str(args.calibration),
+                    "tau_star": float(tau_eff),
+                    "delta_star": float(delta_eff),
+
+                    "index": idx,
+                    "record": rec,
+                    "window_in_record": win_in_rec,
+                    "true_label": true,
+                    "pred": pred,
+                    "is_error": is_err,
+                    "p1": p1, "p2": p2,
+                    "pmax": pmax,
+                    "margin": marg,
+                    "accepted": int(accepted),
+                    "review_reason": review_reason,
+                    "x0": x0, "x1": x1, "x2": x2, "x3": x3,
+                    # NOTE: keep 'X' as a Python-list string for compatibility with load_uncertain_points()
+                    "X": [x0, x1, x2, x3],
+                })
+
+                # Per-record rollup (paper: record-level shift / drift)
+                if rec:
+                    st = rec_stats.setdefault(rec, {
+                        "record": rec,
+                        "n_total": 0,
+                        "n_error": 0,
+                        "n_accept": 0,
+                        "n_accept_error": 0,
+                        "n_review": 0,
+                        "n_review_error": 0,
+                        "n_pred1": 0,
+                        "n_pred1_error": 0,
+                        "n_pred1_accept": 0,
+                        "n_pred1_accept_error": 0,
+                        "n_pred1_review": 0,
+                        "n_pred1_review_error": 0,
+                    })
+
+                    st["n_total"] += 1
+                    st["n_error"] += int(is_err)
+
+                    if accepted:
+                        st["n_accept"] += 1
+                        st["n_accept_error"] += int(is_err)
+                    else:
+                        st["n_review"] += 1
+                        st["n_review_error"] += int(is_err)
+
+                    if pred == 1:
+                        st["n_pred1"] += 1
+                        st["n_pred1_error"] += int(is_err)
+                        if accepted:
+                            st["n_pred1_accept"] += 1
+                            st["n_pred1_accept_error"] += int(is_err)
+                        else:
+                            st["n_pred1_review"] += 1
+                            st["n_pred1_review_error"] += int(is_err)
+
+        logger.info("Saved full TEST predictions -> %s", full_pred_path)
+
+        # Per-record summary for deployment / shift narrative.
+        if rec_stats:
+            rec_path = os.path.join(args.output_folder, "full_test_per_record_summary.csv")
+            with open(rec_path, "w", newline="") as f:
+                fieldnames = [
+                    "record",
+                    "n_total","n_error","error_rate",
+                    "n_accept","risk_accept",
+                    "n_review","capture_review",
+                    "n_pred1","n_pred1_error","error_rate_pred1",
+                    "n_pred1_accept","risk_accept_pred1",
+                    "n_pred1_review","capture_review_pred1",
+                ]
+                w = csv.DictWriter(f, fieldnames=fieldnames)
+                w.writeheader()
+                for rec in sorted(rec_stats.keys()):
+                    st = rec_stats[rec]
+                    n_total = int(st["n_total"])
+                    n_error = int(st["n_error"])
+                    n_accept = int(st["n_accept"])
+                    n_accept_err = int(st["n_accept_error"])
+                    n_review = int(st["n_review"])
+                    n_review_err = int(st["n_review_error"])
+
+                    risk_accept = (n_accept_err / n_accept) if n_accept > 0 else float("nan")
+                    capture_review = (n_review_err / n_error) if n_error > 0 else float("nan")
+
+                    n_pred1 = int(st["n_pred1"])
+                    n_pred1_err = int(st["n_pred1_error"])
+                    n_pred1_accept = int(st["n_pred1_accept"])
+                    n_pred1_accept_err = int(st["n_pred1_accept_error"])
+                    n_pred1_review = int(st["n_pred1_review"])
+                    n_pred1_review_err = int(st["n_pred1_review_error"])
+
+                    risk_accept_pred1 = (n_pred1_accept_err / n_pred1_accept) if n_pred1_accept > 0 else float("nan")
+                    capture_review_pred1 = (n_pred1_review_err / n_pred1_err) if n_pred1_err > 0 else float("nan")
+
+                    w.writerow({
+                        "record": rec,
+                        "n_total": n_total,
+                        "n_error": n_error,
+                        "error_rate": (n_error / n_total) if n_total > 0 else float("nan"),
+                        "n_accept": n_accept,
+                        "risk_accept": risk_accept,
+                        "n_review": n_review,
+                        "capture_review": capture_review,
+
+                        "n_pred1": n_pred1,
+                        "n_pred1_error": n_pred1_err,
+                        "error_rate_pred1": (n_pred1_err / n_pred1) if n_pred1 > 0 else float("nan"),
+                        "n_pred1_accept": n_pred1_accept,
+                        "risk_accept_pred1": risk_accept_pred1,
+                        "n_pred1_review": n_pred1_review,
+                        "capture_review_pred1": capture_review_pred1,
+                    })
+
+            logger.info("Saved full TEST per-record summary -> %s", rec_path)
+
+    except Exception as _e:
+        logger.warning("Failed to export full_test_predictions_ext.csv: %s", _e)
+        
 
     # If multiple budget plans were computed on VAL, evaluate them on TEST to get a real triage curve
     if budget_plans:

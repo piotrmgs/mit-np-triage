@@ -37,71 +37,12 @@ from dataclasses import dataclass
 from sklearn.linear_model import LogisticRegression
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import average_precision_score, precision_recall_curve
-
 import re
 import shutil
 
-
-def _parse_X_value(x: Any, anchor: Optional[Dict[str, Any]] = None) -> Optional[List[float]]:
-    """Parse X that may be stored as a Python list, numpy array, or a string like '[0.1, -0.2, ...]'.
-    Returns list[float] or None if parsing fails.
-    """
-    if x is None:
-        x_list = None
-    elif isinstance(x, (list, tuple, np.ndarray)):
-        try:
-            x_list = [float(v) for v in list(x)]
-        except Exception:
-            x_list = None
-    elif isinstance(x, str):
-        s = x.strip()
-        # Common case: literal list string
-        if s.startswith("[") and s.endswith("]"):
-            try:
-                v = ast.literal_eval(s)
-                if isinstance(v, (list, tuple)):
-                    x_list = [float(t) for t in v]
-                else:
-                    x_list = None
-            except Exception:
-                x_list = None
-        else:
-            x_list = None
-    else:
-        x_list = None
-
-    # Fallback: use explicit columns if present (x0..x3)
-    if (x_list is None or len(x_list) < 4) and isinstance(anchor, dict):
-        vals = []
-        for k in ("x0", "x1", "x2", "x3"):
-            if k in anchor and anchor[k] is not None:
-                try:
-                    vals.append(float(anchor[k]))
-                except Exception:
-                    vals = []
-                    break
-        if len(vals) == 4:
-            x_list = vals
-
-    if x_list is None:
-        return None
-
-
-
-    # Ensure exactly 4 floats (C^2 -> R^4)
-    if len(x_list) > 4:
-        x_list = x_list[:4]
-    return x_list
-
-
-def _anchor_to_xstar(up: Dict[str, Any]) -> np.ndarray:
-    """Convert an anchor dict to an R^4 numpy vector."""
-    x_list = _parse_X_value(up.get("X", None), anchor=up)
-    if x_list is None or len(x_list) != 4:
-        raise ValueError(f"Invalid X for anchor (expected 4 floats). Got: {up.get('X')}")
-    # Also normalize the dict so downstream code sees a parsed list, not a string.
-    up["X"] = x_list
-    return np.asarray(x_list, dtype=np.float32)
+# Module-level logger (handlers configured in __main__).
+# Prevents NameError if helper functions are imported/used standalone.
+logger = logging.getLogger("pp_real")
 
 # Optional deps (allow running with --skip_shap/--skip_lime even if libs are missing)
 try:
@@ -164,7 +105,7 @@ def parse_pp_args():
     # Anchor selection (critical for paper workflow)
     p.add_argument("--max_points", type=int, default=30)
     p.add_argument("--selection", type=str, default="per_record_mixed",
-                   choices=["per_record_mixed", "worst_margin", "random"])
+                   choices=["per_record_mixed", "per_record_random", "worst_margin", "random"])
     p.add_argument("--point_indices", type=str, default="")
 
     # Optional pre-filtering (lets you analyze e.g. high-confidence PVC predictions)
@@ -192,6 +133,30 @@ def parse_pp_args():
         default=float("nan"),
         help="Keep anchors with pmax <= this value (requires 'pmax' column). NaN disables.",
     )
+
+    # --- BSPC Option A: relative "high-confidence" cohort (quantile/top-K) ---
+    p.add_argument(
+        "--filter_pmax_quantile",
+        type=float,
+        default=-1.0,
+        help=(
+            "If in (0,1): keep only anchors with pmax >= quantile(pmax, q) computed "
+            "AFTER other filters (e.g., pred/accepted). Example: 0.90 keeps top-10% by pmax. "
+            "Use -1 to disable."
+        ),
+    )
+    p.add_argument(
+        "--filter_pmax_topk",
+        type=int,
+        default=0,
+        help=(
+            "If >0: keep only TOP-K anchors by pmax AFTER applying filter_pmax_quantile. "
+            "Useful to keep a fixed cohort size across seeds (e.g., 300)."
+        ),
+    )
+    # ------------------------------------------------------------------------
+
+
     p.add_argument(
         "--filter_accepted_only",
         action="store_true",
@@ -371,6 +336,81 @@ def mean_ci95(values):
     sd = var ** 0.5
     ci = 1.96 * sd / (n ** 0.5)
     return m, ci
+
+
+# -------------------------
+# Robust parsing of anchors
+# -------------------------
+def _parse_X_field(x: Any) -> Optional[np.ndarray]:
+    """Parse an anchor's X field into a float32 vector of shape (4,).
+
+    Accepts:
+      - list/tuple/np.ndarray with 4 numbers
+      - string representations like "[1, 2, 3, 4]" or "1,2,3,4"
+    Returns None if parsing fails.
+    """
+    if x is None:
+        return None
+    if isinstance(x, np.ndarray):
+        arr = x.astype(np.float32).reshape(-1)
+        return arr
+    if isinstance(x, (list, tuple)):
+        try:
+            arr = np.asarray(x, dtype=np.float32).reshape(-1)
+            return arr
+        except Exception:
+            return None
+    if isinstance(x, str):
+        s = x.strip()
+        if not s:
+            return None
+        # Try Python-literal list first (safe for lists/numbers)
+        try:
+            val = ast.literal_eval(s)
+            if isinstance(val, (list, tuple, np.ndarray)):
+                arr = np.asarray(val, dtype=np.float32).reshape(-1)
+                return arr
+        except Exception:
+            pass
+        # Fallback: comma-separated
+        try:
+            parts = [p.strip() for p in s.strip("[]()").split(",") if p.strip()]
+            arr = np.asarray([float(p) for p in parts], dtype=np.float32).reshape(-1)
+            return arr
+        except Exception:
+            return None
+    # Unknown type
+    return None
+
+
+def _anchor_to_xstar(u: Dict[str, Any]) -> np.ndarray:
+    """Extract xstar (R^4) from an anchor dict.
+
+    Priority:
+      1) u['X'] (robust parsing)
+      2) explicit columns x0..x3 (common in *_ext.csv exports)
+    """
+    x = _parse_X_field(u.get("X"))
+    if x is None or x.size == 0:
+        # fallback to x0..x3
+        xs = []
+        for k in ("x0", "x1", "x2", "x3"):
+            if k in u:
+                try:
+                    xs.append(float(u.get(k)))
+                except Exception:
+                    xs.append(float("nan"))
+        if len(xs) == 4 and all(np.isfinite(xs)):
+            x = np.asarray(xs, dtype=np.float32)
+    if x is None or x.size != 4:
+        raise ValueError(f"Could not parse anchor X into R^4. Got type={type(u.get('X'))} value={u.get('X')}")
+    x = x.astype(np.float32).reshape(4,)
+    # Normalize in-place so other code paths don't see stringified lists.
+    try:
+        u["X"] = x.tolist()
+    except Exception:
+        pass
+    return x
 
 
 
@@ -1017,19 +1057,42 @@ def write_paper_summary_md(
             )
             lines.append("")
 
-            # Small narrative hook (top-2 comparison if available)
+            # Small narrative hook (baseline vs best Puiseux proxy in THIS cohort)
             try:
-                base_row = df_tri.loc[df_tri["score_name"] == "uncert_margin"].head(1)
-                pu_row = df_tri.loc[df_tri["score_name"] == "puiseux_inv_rflip"].head(1)
-                if len(base_row) == 1 and len(pu_row) == 1:
-                    ap_base = float(base_row["auprc"].iloc[0])
-                    ap_pu = float(pu_row["auprc"].iloc[0])
+                df_tri2 = df_tri.copy()
+                df_tri2["score"] = df_tri2["score"].astype(str)
+
+                # Baseline: standard uncertainty ranking
+                base_name = None
+                for cand in ["Uncert:1-margin", "Uncert:1-pmax"]:
+                    if (df_tri2["score"] == cand).any():
+                        base_name = cand
+                        break
+
+                # Best Puiseux-like proxy (robust: "Puiseux:*" and "puiseux_*")
+                pu_mask = df_tri2["score"].str.match(r"^(Puiseux:|puiseux_)")
+                pu_best = None
+                if pu_mask.any():
+                    pu_best = (
+                        df_tri2.loc[pu_mask]
+                             .sort_values("auprc", ascending=False)
+                             .iloc[0]["score"]
+                    )
+
+                if base_name is not None and pu_best is not None:
+                    ap_base = float(df_tri2.loc[df_tri2["score"] == base_name, "auprc"].iloc[0])
+                    ap_pu = float(df_tri2.loc[df_tri2["score"] == pu_best, "auprc"].iloc[0])
+                    delta = ap_pu - ap_base
+
                     lines.append(
-                        f"**Key result:** Puiseux flip-radius probe (score=1/r_flip) achieves AUPRC={ap_pu:.3f} versus margin-based uncertainty AUPRC={ap_base:.3f} on the analyzed set."
+                        f"**Key result (audit set):** best Puiseux proxy **{pu_best}** achieves "
+                        f"AUPRC={ap_pu:.3f} versus baseline **{base_name}** AUPRC={ap_base:.3f} "
+                        f"(Δ={delta:+.3f})."
                     )
                     lines.append("")
             except Exception:
                 pass
+
 
             # Main table
             lines.append(df_tri.head(8).to_markdown(index=False))
@@ -1053,6 +1116,78 @@ def write_paper_summary_md(
         except Exception as e:
             lines.append(f"(Failed to summarize triage_error_auc_compare.csv: {e})")
            
+
+    # ------------------------------------------------------------------
+    # Puiseux vs baseline directions (flip-radius comparison)
+    # ------------------------------------------------------------------
+    dom_path = os.path.join(out_dir, "dominant_ratio_summary.csv")
+    if os.path.isfile(dom_path):
+        try:
+            df_dom = pd.read_csv(dom_path)
+            if df_dom is not None and len(df_dom) and ("r_flip_cens" in df_dom.columns):
+                r_pu = pd.to_numeric(df_dom["r_flip_cens"], errors="coerce").astype(float)
+                r_max = float(np.nanmax(r_pu.values)) if np.isfinite(np.nanmax(r_pu.values)) else float("nan")
+                r_pu = r_pu.fillna(r_max if np.isfinite(r_max) else 0.05).values
+
+                rows = []
+                for col, name in [
+                    ("flip_grad", "Gradient direction"),
+                    ("flip_lime", "LIME top-axis"),
+                    ("flip_shap", "SHAP top-axis"),
+                ]:
+                    if col not in df_dom.columns:
+                        continue
+                    r_b = pd.to_numeric(df_dom[col], errors="coerce").astype(float)
+                    r_b = r_b.fillna(r_max if np.isfinite(r_max) else 0.05).values
+
+                    # Puiseux better = finds closer flip
+                    better = (r_pu + 1e-12) < r_b
+                    share_better = float(np.mean(better)) if len(better) else float("nan")
+
+                    ratio = r_b / np.maximum(r_pu, 1e-12)
+                    ratio = ratio[np.isfinite(ratio)]
+                    med_ratio = float(np.median(ratio)) if ratio.size else float("nan")
+
+                    delta = (r_b - r_pu)
+                    delta = delta[np.isfinite(delta)]
+                    med_delta = float(np.median(delta)) if delta.size else float("nan")
+
+                    rows.append({
+                        "baseline": name,
+                        "share_puiseux_closer": share_better,
+                        "median(baseline/puiseux)": med_ratio,
+                        "median(baseline - puiseux)": med_delta,
+                    })
+
+                if rows:
+                    lines.append("## Puiseux-guided robustness probe vs baseline directions (flip-radius)")
+                    lines.append(
+                        "This section compares the *observed/censored flip-radius* found along Puiseux-guided candidate directions "
+                        "against baseline directions (gradient/LIME/SHAP). It is an expensive probe and should not be conflated "
+                        "with cheap Puiseux coefficient proxies such as 1/r_dom."
+                    )
+                    lines.append("")
+                    lines.append("")
+                    if np.isfinite(r_max):
+                        lines.append(f"- censoring radius r_max ≈ {r_max:.3f} (used when no flip is found within budget)")
+                    lines.append(f"- n_points_with_dom_summary = {len(df_dom)}")
+                    lines.append("")
+                    lines.append(pd.DataFrame(rows).to_markdown(index=False))
+                    lines.append("")
+
+                # Optional: summarize r_onset if present
+                if "puiseux_r_onset_min" in df_dom.columns:
+                    ron = pd.to_numeric(df_dom["puiseux_r_onset_min"], errors="coerce").astype(float)
+                    ron = ron[np.isfinite(ron)]
+                    if len(ron):
+                        lines.append("### Puiseux term-spectrum onset radius (from expansions)")
+                        lines.append("")
+                        lines.append(f"- puiseux_r_onset_min: median={float(np.median(ron)):.4f}, q25={float(np.quantile(ron,0.25)):.4f}, q75={float(np.quantile(ron,0.75)):.4f}")
+                        lines.append("")
+
+        except Exception as e:
+            lines.append(f"(Failed to summarize dominant_ratio_summary.csv: {e})")
+
 
 
     out_path = os.path.join(out_dir, "paper_summary.md")
@@ -1172,6 +1307,241 @@ def parse_kv_from_text(text: str) -> Dict[str, float]:
         except Exception:
             continue
     return out
+
+
+
+# ============================================================
+# Puiseux term-spectrum helpers (robust to fractional powers)
+# ============================================================
+
+def _sympy_to_complex_val(z: Any, *, prec: int = 50) -> Optional[complex]:
+    """
+    Best-effort conversion of a SymPy object to Python complex.
+    Returns None if conversion fails (e.g., symbolic leftovers).
+    """
+    try:
+        return complex(sympy.N(z, prec))
+    except Exception:
+        try:
+            return complex(z)
+        except Exception:
+            return None
+
+
+def _puiseux_extract_terms(
+    expr: sympy.Expr,
+    x_sym: sympy.Symbol,
+    *,
+    coeff_eps: float = 1e-12,
+    max_terms: int = 16,
+) -> List[Tuple[float, complex]]:
+    """
+    Extract (exponent, coefficient) pairs for a univariate series in x_sym.
+    Works with fractional exponents (Puiseux) by using as_powers_dict().
+    Returns terms sorted by exponent ascending, combined by near-equal exponents.
+    """
+    expr = sympy.expand(expr)
+    parts = sympy.Add.make_args(expr)
+    raw: List[Tuple[float, complex]] = []
+
+    for t in parts:
+        try:
+            pdict = t.as_powers_dict()
+            exp_obj = pdict.get(x_sym, sympy.Integer(0))
+        except Exception:
+            exp_obj = sympy.Integer(0)
+
+        try:
+            exp_val = float(exp_obj)
+        except Exception:
+            try:
+                exp_val = float(sympy.N(exp_obj))
+            except Exception:
+                continue
+
+        # coefficient = t / x^exp
+        try:
+            coeff_expr = t / (x_sym ** exp_obj) if exp_obj != 0 else t
+        except Exception:
+            coeff_expr = t
+
+        coeff_c = _sympy_to_complex_val(coeff_expr)
+        if coeff_c is None:
+            continue
+        if abs(coeff_c) <= float(coeff_eps):
+            continue
+
+        raw.append((float(exp_val), coeff_c))
+
+    raw.sort(key=lambda p: p[0])
+
+    # combine nearly identical exponents
+    combined: List[Tuple[float, complex]] = []
+    for e, c in raw:
+        if combined and abs(e - combined[-1][0]) < 1e-9:
+            combined[-1] = (combined[-1][0], combined[-1][1] + c)
+        else:
+            combined.append((e, c))
+
+    combined = [(e, c) for e, c in combined if abs(c) > float(coeff_eps)]
+    return combined[: int(max_terms)]
+
+
+def _puiseux_first_two_term_onset(
+    terms: List[Tuple[float, complex]],
+    *,
+    coeff_eps: float = 1e-12,
+) -> Tuple[float, float, float, float, float]:
+    """
+    Given sorted terms [(exp0,c0),(exp1,c1),...], find first two distinct exponents
+    and compute r_onset where |c0| r^exp0 == |c1| r^exp1:
+        r_onset = (|c0|/|c1|)^(1/(exp1-exp0))
+    Returns: (r_onset, exp0, exp1, |c0|, |c1|). If not computable -> NaNs.
+    """
+    if not terms or len(terms) < 2:
+        return (float("nan"), float("nan"), float("nan"), float("nan"), float("nan"))
+
+    e0, c0 = terms[0]
+    a0 = float(abs(c0))
+    if not np.isfinite(a0) or a0 <= coeff_eps:
+        return (float("nan"), float("nan"), float("nan"), float("nan"), float("nan"))
+
+    for e1, c1 in terms[1:]:
+        if float(e1) <= float(e0) + 1e-9:
+            continue
+        a1 = float(abs(c1))
+        if not np.isfinite(a1) or a1 <= coeff_eps:
+            continue
+        gap = float(e1 - e0)
+        if gap <= 1e-12:
+            continue
+        r = (a0 / max(a1, coeff_eps)) ** (1.0 / gap)
+        return (float(r), float(e0), float(e1), float(a0), float(a1))
+
+    return (float("nan"), float(e0), float("nan"), float(a0), float("nan"))
+
+
+def puiseux_term_metrics_from_interpret(
+    interpret_results: List[Dict[str, Any]],
+    *,
+    x_sym: sympy.Symbol,
+    y_sym: sympy.Symbol,
+    coeff_eps: float = 1e-12,
+) -> Dict[str, Any]:
+    """
+    Compute Puiseux term-spectrum metrics from interpret_puiseux_expansions() output.
+    This is robust when expansions include fractional powers (x^(p/q)).
+
+    Returns a dict with keys (all floats/ints, NaN-safe):
+      - puiseux_branch_count
+      - puiseux_branches_parsed
+      - puiseux_has_fractional
+      - puiseux_lead_exp_min
+      - puiseux_next_exp_min
+      - puiseux_gap_min
+      - puiseux_c_lead_max_abs
+      - puiseux_c_next_max_abs
+      - puiseux_r_onset_min
+      - puiseux_r_onset_median
+    """
+    meta: Dict[str, Any] = {
+        "puiseux_branch_count": int(len(interpret_results) if interpret_results else 0),
+        "puiseux_branches_parsed": 0,
+        "puiseux_has_fractional": 0,
+        "puiseux_lead_exp_min": float("nan"),
+        "puiseux_next_exp_min": float("nan"),
+        "puiseux_gap_min": float("nan"),
+        "puiseux_c_lead_max_abs": float("nan"),
+        "puiseux_c_next_max_abs": float("nan"),
+        "puiseux_r_onset_min": float("nan"),
+        "puiseux_r_onset_median": float("nan"),
+    }
+
+    if not interpret_results:
+        return meta
+
+    lead_exps: List[float] = []
+    next_exps: List[float] = []
+    gaps: List[float] = []
+    c0_abs_list: List[float] = []
+    c1_abs_list: List[float] = []
+    ronsets: List[float] = []
+    has_frac = False
+
+    for ir in interpret_results:
+        expr_repr = ir.get("puiseux_expr", None)
+        if expr_repr is None:
+            continue
+
+        if isinstance(expr_repr, sympy.Expr):
+            e = sympy.expand(expr_repr)
+        else:
+            # Sympify string with stable locals (x,y,I)
+            try:
+                e = sympy.expand(sympy.sympify(str(expr_repr), locals={"x": x_sym, "y": y_sym, "I": sympy.I}))
+            except Exception:
+                try:
+                    e = sympy.expand(sympy.sympify(str(expr_repr)))
+                except Exception:
+                    continue
+
+        terms = _puiseux_extract_terms(e, x_sym, coeff_eps=coeff_eps)
+        if not terms:
+            continue
+
+        meta["puiseux_branches_parsed"] = int(meta["puiseux_branches_parsed"]) + 1
+
+        # fractional exponent flag
+        for ee, _cc in terms:
+            if abs(float(ee) - round(float(ee))) > 1e-9:
+                has_frac = True
+                break
+
+        r_on, e0, e1, a0, a1 = _puiseux_first_two_term_onset(terms, coeff_eps=coeff_eps)
+        if np.isfinite(e0):
+            lead_exps.append(float(e0))
+        if np.isfinite(e1):
+            next_exps.append(float(e1))
+            gaps.append(float(e1 - e0))
+        if np.isfinite(a0):
+            c0_abs_list.append(float(a0))
+        if np.isfinite(a1):
+            c1_abs_list.append(float(a1))
+        if np.isfinite(r_on):
+            ronsets.append(float(r_on))
+
+    meta["puiseux_has_fractional"] = int(bool(has_frac))
+
+    def _nanmin(xs: List[float]) -> float:
+        if not xs:
+            return float("nan")
+        arr = np.asarray(xs, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        return float(np.min(arr)) if arr.size else float("nan")
+
+    def _nanmax(xs: List[float]) -> float:
+        if not xs:
+            return float("nan")
+        arr = np.asarray(xs, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        return float(np.max(arr)) if arr.size else float("nan")
+
+    def _nanmedian(xs: List[float]) -> float:
+        if not xs:
+            return float("nan")
+        arr = np.asarray(xs, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        return float(np.median(arr)) if arr.size else float("nan")
+
+    meta["puiseux_lead_exp_min"] = _nanmin(lead_exps)
+    meta["puiseux_next_exp_min"] = _nanmin(next_exps)
+    meta["puiseux_gap_min"] = _nanmin(gaps)
+    meta["puiseux_c_lead_max_abs"] = _nanmax(c0_abs_list)
+    meta["puiseux_c_next_max_abs"] = _nanmax(c1_abs_list)
+    meta["puiseux_r_onset_min"] = _nanmin(ronsets)
+    meta["puiseux_r_onset_median"] = _nanmedian(ronsets)
+
+    return meta
 
 
 
@@ -1817,7 +2187,16 @@ def fit_beta_from_full_val_npz(in_dir: str) -> Tuple[float, float, float]:
         raise FileNotFoundError(f"Missing {full_val_npz}")
 
     arr = np.load(full_val_npz)
-    probs_raw = np.asarray(arr["probs_raw"], dtype=float)
+    # Robustness: some runs store only logits_raw (no probs_raw).
+    if "probs_raw" in arr.files:
+        probs_raw = np.asarray(arr["probs_raw"], dtype=float)
+    elif "logits_raw" in arr.files:
+        logits_raw = np.asarray(arr["logits_raw"], dtype=float)
+        m = np.max(logits_raw, axis=1, keepdims=True)
+        ex = np.exp(logits_raw - m)
+        probs_raw = ex / np.clip(ex.sum(axis=1, keepdims=True), 1e-12, np.inf)
+    else:
+        raise KeyError("full_val_arrays.npz must contain 'probs_raw' or 'logits_raw' for BETA calibration.")
     p_raw = np.clip(probs_raw[:, 1], 1e-6, 1.0 - 1e-6)
 
     # Preferred: match up_real's calibrated probs
@@ -1878,7 +2257,16 @@ def fit_isotonic_from_full_val_npz(in_dir: str) -> IsotonicRegression:
         raise FileNotFoundError(f"Missing {full_val_npz}")
 
     arr = np.load(full_val_npz)
-    probs_raw = np.asarray(arr["probs_raw"], dtype=float)
+    # Robustness: some runs store only logits_raw (no probs_raw).
+    if "probs_raw" in arr.files:
+        probs_raw = np.asarray(arr["probs_raw"], dtype=float)
+    elif "logits_raw" in arr.files:
+        logits_raw = np.asarray(arr["logits_raw"], dtype=float)
+        m = np.max(logits_raw, axis=1, keepdims=True)
+        ex = np.exp(logits_raw - m)
+        probs_raw = ex / np.clip(ex.sum(axis=1, keepdims=True), 1e-12, np.inf)
+    else:
+        raise KeyError("full_val_arrays.npz must contain 'probs_raw' or 'logits_raw' for ISOTONIC calibration.")
     p_raw = probs_raw[:, 1].reshape(-1)
 
     # Preferred: match up_real's calibrated probs
@@ -1990,7 +2378,7 @@ def add_uncertainty_ranks(
     return df
 
 
-def resolve_in_dir(output_folder: str) -> str:
+def resolve_in_dir(output_folder: str, *, required_files: Optional[List[str]] = None) -> str:
     """
     Resolve actual directory with up_real artifacts.
     Works if `output_folder` is:
@@ -1998,7 +2386,7 @@ def resolve_in_dir(output_folder: str) -> str:
       - a parent directory containing run subfolders.
     """
     base = os.path.abspath(os.path.expanduser(output_folder))
-    required = ["best_model_full.pt", "uncertain_full.csv"]
+    required = list(required_files) if required_files else ["best_model_full.pt", "uncertain_full.csv"]
 
     def is_run_dir(d: str) -> bool:
         return all(os.path.isfile(os.path.join(d, r)) for r in required)
@@ -2017,7 +2405,7 @@ def resolve_in_dir(output_folder: str) -> str:
         raise FileNotFoundError(
             "Could not locate up_real artifact directory.\n"
             f"Base: {base}\n"
-            f"Expected at least: {required}\n"
+            f"Required files: {required}\n"
             "Tried: base itself, base/*, base/runs/*"
         )
 
@@ -2053,7 +2441,11 @@ def _attach_uncertain_meta(up_list: List[Dict[str, Any]], df_ext: pd.DataFrame) 
         except Exception:
             continue
         if idx in meta_map:
-            u.update(meta_map[idx])
+            # Do NOT overwrite the raw feature vector 'X' coming from load_uncertain_points();
+            # in some exports it is a string like "[...]" and would clobber a parsed list/array.
+            row = dict(meta_map[idx])
+            row.pop("X", None)
+            u.update(row)
             # normalize a few keys
             if "record" in u:
                 u["record"] = str(u["record"])
@@ -2166,6 +2558,39 @@ def _select_uncertain_subset(
 
     if selection == "random":
         return rng.sample(up_list, k=max_points)
+
+    if selection == "per_record_random":
+        # Random sampling but approximately balanced across records.
+        by_rec: Dict[str, List[Dict[str, Any]]] = {}
+        for u in up_list:
+            rec = str(u.get("record", "NA"))
+            by_rec.setdefault(rec, []).append(u)
+    
+        recs = sorted(by_rec.keys())
+        if not recs:
+            return []
+    
+        per_rec = max(1, max_points // len(recs))
+        selected: List[Dict[str, Any]] = []
+        used_ids = set()
+        for rec in recs:
+            u_list = by_rec[rec]
+            k = min(per_rec, len(u_list))
+            if k <= 0:
+                continue
+            picks = rng.sample(u_list, k=k)
+            selected.extend(picks)
+            used_ids.update(id(u) for u in picks)
+    
+        # Fill any remainder uniformly at random from the leftover pool.
+        if len(selected) < max_points:
+            remaining = [u for u in up_list if id(u) not in used_ids]
+            k = min(max_points - len(selected), len(remaining))
+            if k > 0:
+                selected.extend(rng.sample(remaining, k=k))
+    
+        return selected[:max_points]        
+
 
     # default: per_record_mixed
     by_rec: Dict[str, List[Dict[str, Any]]] = {}
@@ -2359,6 +2784,7 @@ def run_puiseux_error_triage_eval(
       - dominant_ratio_summary.csv (contains r_flip_cens, r_dom, etc.)
 
     Outputs (written to out_dir):
+      - triage_error_scores_joined.csv
       - triage_error_auc_compare.csv
       - triage_error_auc_diff_vs_uncert_margin.csv
       - triage_error_budget_curve.csv
@@ -2380,14 +2806,33 @@ def run_puiseux_error_triage_eval(
         logger.warning('[TRIAGE] No errors in selected_uncertain_points -> skipping triage eval')
         return None
 
-    # Effective Puiseux flip radius (censored at the scan budget when no flip is observed)
-    r_flip_puiseux = df['r_flip_cens'].astype(float).fillna(0.05).values
-    score_puiseux = 1.0 / np.maximum(r_flip_puiseux, 1e-12)
+    # Effective Puiseux flip radius (censored at r_max when no flip is observed).
+    # NOTE: because we now return r_max when no flip is found, this should be finite and meaningful.
+    if 'r_flip_cens' in df.columns:
+        r_flip_puiseux = pd.to_numeric(df['r_flip_cens'], errors='coerce')
+        # fallback: if NaN, use the max finite censoring radius observed
+        r_fallback = float(np.nanmax(r_flip_puiseux.values)) if np.isfinite(np.nanmax(r_flip_puiseux.values)) else 0.05
+        r_flip_puiseux = r_flip_puiseux.fillna(r_fallback).values.astype(float)
+    else:
+        r_flip_puiseux = np.full(len(df), 0.05, dtype=float)
+    score_attack_inv_rflip = 1.0 / np.maximum(r_flip_puiseux, 1e-12)
 
-    # Baselines
-    score_margin = (1.0 - df['margin'].astype(float)).values
-    score_pmax = (1.0 - df['pmax'].astype(float)).values
-    score_grad_norm = df.get('saliency_grad_norm', pd.Series(np.zeros(len(df)))).astype(float).values
+    # Baselines (higher score => more likely to review)
+    if 'margin' in df.columns:
+        m = pd.to_numeric(df['margin'], errors='coerce').astype(float).values
+        # if margin missing -> treat as very certain (rank low for review)
+        m = np.nan_to_num(m, nan=1.0, posinf=1.0, neginf=1.0)
+        score_margin = (1.0 - m)
+    else:
+        score_margin = np.zeros(len(df), dtype=float)
+
+    if 'pmax' in df.columns:
+        pm = pd.to_numeric(df['pmax'], errors='coerce').astype(float).values
+        pm = np.nan_to_num(pm, nan=1.0, posinf=1.0, neginf=1.0)
+        score_pmax = (1.0 - pm)
+    else:
+        score_pmax = np.zeros(len(df), dtype=float)
+    score_grad_norm = pd.to_numeric(df.get('saliency_grad_norm', pd.Series(np.zeros(len(df)))), errors='coerce').fillna(0.0).astype(float).values
 
     # XAI-ray baseline (min flip radius over {grad, LIME-axis, SHAP-axis})
     xai_cols = [c for c in ['flip_grad', 'flip_lime', 'flip_shap'] if c in df.columns]
@@ -2397,22 +2842,159 @@ def run_puiseux_error_triage_eval(
     else:
         score_xai = None
 
-    # Puiseux dominance proxy (smaller r_dom => more quartic-dominant locally)
+    # Puiseux dominance proxy:
+    # Empirically, in the "silent-failure high-confidence PVC" cohort, **r_dom itself** was informative
+    # (not necessarily its inverse). We include both directions to avoid sign mistakes.
+    score_r_dom = None
+    score_inv_r_dom = None
     if 'r_dom' in df.columns:
-        score_inv_r_dom = 1.0 / np.maximum(df['r_dom'].astype(float).values, 1e-12)
+        rdom = pd.to_numeric(df['r_dom'], errors='coerce').astype(float).values
+        score_r_dom = rdom
+        score_inv_r_dom = 1.0 / np.maximum(rdom, 1e-12)
+
+    # Puiseux coefficient proxy (quartic magnitude) — include both |c4| and 1/|c4|
+    score_abs_c4 = None
+    score_inv_abs_c4 = None
+    if 'c4_max_abs' in df.columns:
+        c4 = pd.to_numeric(df['c4_max_abs'], errors='coerce').astype(float).values
+        score_abs_c4 = c4
+        score_inv_abs_c4 = 1.0 / np.maximum(c4, 1e-12)
+
+        # Puiseux ratio proxy: |c4|/|c2|  (if available)
+        score_c4_over_c2 = None
+        if 'c2_max_abs' in df.columns:
+            c2 = pd.to_numeric(df['c2_max_abs'], errors='coerce').astype(float).values
+            score_c4_over_c2 = np.abs(c4) / (np.abs(c2) + 1e-12)
     else:
-        score_inv_r_dom = None
+        score_c4_over_c2 = None
+        
+
+    # Local-fit proxy (non-Puiseux baseline): RMSE (merge if available)
+    fit_path = os.path.join(out_dir, 'local_fit_summary.csv')
+    if os.path.isfile(fit_path):
+        try:
+            fit = pd.read_csv(fit_path)
+            if 'point' in fit.columns:
+                df = df.merge(fit[['point','RMSE','corr_pearson','sign_agree']], on='point', how='left')
+        except Exception:
+            pass
+    score_rmse = None
+    if 'RMSE' in df.columns:
+        score_rmse = pd.to_numeric(df['RMSE'], errors='coerce').fillna(0.0).astype(float).values
+
+    # Kink proxy (optional)
+    score_kink = None
+    if 'frac_kink' in df.columns:
+        score_kink = pd.to_numeric(df['frac_kink'], errors='coerce').fillna(0.0).astype(float).values
+
+    # NEW: Puiseux term-spectrum proxies (robust to fractional powers)
+    score_inv_ronset_min = None
+    if 'puiseux_r_onset_min' in df.columns:
+        r_on = pd.to_numeric(df['puiseux_r_onset_min'], errors='coerce').astype(float).values
+        score_inv_ronset_min = 1.0 / np.maximum(r_on, 1e-12)
+
+    score_inv_ronset_med = None
+    if 'puiseux_r_onset_median' in df.columns:
+        r_onm = pd.to_numeric(df['puiseux_r_onset_median'], errors='coerce').astype(float).values
+        score_inv_ronset_med = 1.0 / np.maximum(r_onm, 1e-12)
+
+    score_abs_cnext = None
+    score_inv_abs_cnext = None
+    if 'puiseux_c_next_max_abs' in df.columns:
+        cnext = pd.to_numeric(df['puiseux_c_next_max_abs'], errors='coerce').astype(float).values
+        score_abs_cnext = cnext
+        score_inv_abs_cnext = 1.0 / np.maximum(cnext, 1e-12)        
 
     scores: Dict[str, np.ndarray] = {
-        'puiseux_inv_rflip': score_puiseux,
-        'uncert_margin': score_margin,
-        'uncert_pmax': score_pmax,
-        'grad_norm': score_grad_norm,
-    }
+            # confidence baselines
+            'Uncert:1-margin': score_margin,
+            'Uncert:1-pmax': score_pmax,
+            'Grad:||∇||': score_grad_norm,
+
+            # expensive probe baseline (NOT a Puiseux proxy)
+            'Attack:inv_rflip_cens': score_attack_inv_rflip,
+        }
+
     if score_xai is not None:
         scores['xai_inv_rflip'] = score_xai
+    # Puiseux proxies (cheap geometry scores)
     if score_inv_r_dom is not None:
-        scores['puiseux_inv_rdom'] = score_inv_r_dom
+        scores['Puiseux:inv_r_dom'] = score_inv_r_dom
+    if score_abs_c4 is not None:
+        scores['Puiseux:|c4|'] = score_abs_c4
+    if score_c4_over_c2 is not None:
+        scores['Puiseux:|c4|/|c2|'] = score_c4_over_c2
+
+    # Optional ablations (keep if you want extra diagnostics)
+    if score_r_dom is not None:
+        scores['Puiseux:r_dom_raw'] = score_r_dom
+    if score_inv_abs_c4 is not None:
+        scores['Puiseux:inv|c4|'] = score_inv_abs_c4
+
+    if score_rmse is not None:
+        scores['local_rmse'] = score_rmse
+    if score_kink is not None:
+        scores['kink_frac'] = score_kink
+
+
+    if score_inv_ronset_min is not None:
+        scores['puiseux_inv_ronset_min'] = score_inv_ronset_min
+    if score_inv_ronset_med is not None:
+        scores['puiseux_inv_ronset_median'] = score_inv_ronset_med
+    if score_abs_cnext is not None:
+        scores['puiseux_abs_cnext'] = score_abs_cnext
+    if score_inv_abs_cnext is not None:
+        scores['puiseux_inv_abs_cnext'] = score_inv_abs_cnext
+
+    # Combined heuristic: Puiseux flip score × gradient norm
+    # (often highlights "sharp but nearby" boundaries)
+    try:
+        scores['Attack:inv_rflip_cens_x_gradnorm'] = score_attack_inv_rflip * score_grad_norm
+    except Exception:
+        pass
+
+    # Sanitize: AUPRC cannot handle NaN/inf scores
+    def _sanitize_score(s: np.ndarray) -> np.ndarray:
+        s = np.asarray(s, dtype=float)
+        finite = np.isfinite(s)
+        if not finite.any():
+            return np.zeros_like(s, dtype=float)
+        fill = float(np.min(s[finite]))
+        out = s.copy()
+        out[~finite] = fill
+        return out
+
+    for k in list(scores.keys()):
+        scores[k] = _sanitize_score(scores[k])   
+
+
+    # Persist joined per-point score table (useful for NP-analysis / debugging / supplements)
+    # This makes the triage step fully auditable: label + all scores per analyzed anchor.
+    try:
+        meta_cols = []
+        for c in [
+            "point", "pp_id", "index", "record", "window_in_record",
+            "true_label", "pred",
+            "pmax", "margin",
+            "pmax_raw", "margin_raw",
+            "pmax_cal", "margin_cal",
+        ]:
+            if c in df.columns:
+                meta_cols.append(c)
+
+        df_join = df[meta_cols].copy() if meta_cols else pd.DataFrame(index=np.arange(len(df)))
+        df_join["is_error"] = y.astype(int)
+
+        # Add every score as a separate column (already sanitized to be finite)
+        for name, s in scores.items():
+            df_join[name] = np.asarray(s, dtype=float)
+
+        df_join.to_csv(os.path.join(out_dir, "triage_error_scores_joined.csv"), index=False)
+        logger.info("[TRIAGE] Wrote triage_error_scores_joined.csv (rows=%d, scores=%d)", len(df_join), len(scores))
+    except Exception as e:
+        logger.warning("[TRIAGE] Failed to write triage_error_scores_joined.csv: %s", e)
+
+
 
     # AUPRC table + bootstrap CI
     auc_rows = []
@@ -2423,12 +3005,12 @@ def run_puiseux_error_triage_eval(
     auc_df.to_csv(os.path.join(out_dir, 'triage_error_auc_compare.csv'), index=False)
 
     # Pairwise ΔAUPRC vs a strong, standard baseline (margin)
-    if 'uncert_margin' in scores:
+    if 'Uncert:1-margin' in scores:
         diff_rows = []
         for name, s in scores.items():
-            if name == 'uncert_margin':
+            if name == 'Uncert:1-margin':
                 continue
-            d, lo, hi = _bootstrap_auprc_diff_ci(y, s, scores['uncert_margin'], n_boot=n_boot, seed=seed)
+            d, lo, hi = _bootstrap_auprc_diff_ci(y, s, scores['Uncert:1-margin'], n_boot=n_boot, seed=seed)
             diff_rows.append({'score': name, 'delta_auprc_vs_margin': d, 'ci_low': lo, 'ci_high': hi})
         pd.DataFrame(diff_rows).sort_values('delta_auprc_vs_margin', ascending=False).to_csv(
             os.path.join(out_dir, 'triage_error_auc_diff_vs_uncert_margin.csv'), index=False
@@ -2444,27 +3026,62 @@ def run_puiseux_error_triage_eval(
     curve_df = pd.concat(curves, ignore_index=True)
     curve_df.to_csv(os.path.join(out_dir, 'triage_error_budget_curve.csv'), index=False)
 
-    # PR plot (top-k curves by AUPRC)
+    # PR plot: always include margin baseline + best Puiseux-type proxy (if available),
+    # then fill remaining slots up to pr_max_curves by global AUPRC ranking.
     try:
-        top_names = auc_df['score'].head(int(pr_max_curves)).tolist()
+        kmax = int(max(1, pr_max_curves))
+
+        chosen: List[str] = []
+
+        # (1) Always include the standard uncertainty baseline
+        if "Uncert:1-margin" in scores:
+            chosen.append("Uncert:1-margin")
+
+        # (2) Always include the best Puiseux-like proxy in THIS cohort
+        # Robust: includes both "Puiseux:*" and legacy "puiseux_*" names.
+        try:
+            pu_mask = auc_df["score"].astype(str).str.match(r"^(Puiseux:|puiseux_)")
+            pu_df = auc_df[pu_mask].copy()
+            if len(pu_df):
+                best_pu = str(pu_df.iloc[0]["score"])
+                if best_pu in scores and best_pu not in chosen:
+                    chosen.append(best_pu)
+        except Exception:
+            pass
+
+        # (3) Fill remaining slots by AUPRC (global ranking)
+        for name in auc_df["score"].astype(str).tolist():
+            if name in chosen:
+                continue
+            if name not in scores:
+                continue
+            chosen.append(name)
+            if len(chosen) >= kmax:
+                break
+
+        chosen = chosen[:kmax]
+
         plt.figure()
-        for name in top_names:
+        for name in chosen:
             s = scores[name]
             prec, rec, _ = precision_recall_curve(y, s)
             ap = float(average_precision_score(y, s))
             plt.plot(rec, prec, label=f"{name} (AP={ap:.3f})")
+
         base = float(y.mean())
-        plt.hlines(base, 0, 1, linestyles='dashed', label=f"prevalence={base:.3f}")
-        plt.xlabel('Recall')
-        plt.ylabel('Precision')
-        plt.title('Error triage on selected uncertain points (audit set)')
+        plt.hlines(base, 0, 1, linestyles="dashed", label=f"prevalence={base:.3f}")
+
+        plt.xlabel("Recall")
+        plt.ylabel("Precision")
+        plt.title("Error triage on selected anchors (audit set)")
         plt.legend()
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        plt.savefig(os.path.join(out_dir, 'triage_error_pr_curve.png'), dpi=200)
+        plt.savefig(os.path.join(out_dir, "triage_error_pr_curve.png"), dpi=200)
         plt.close()
     except Exception as e:
-        logger.warning('[TRIAGE] Could not create PR curve plot: %s', e)
+        logger.warning("[TRIAGE] Could not create PR curve plot: %s", e)
+
 
     logger.info('[TRIAGE] Wrote triage_error_auc_compare.csv + triage_error_budget_curve.csv')
     return auc_df
@@ -2712,22 +3329,7 @@ if __name__ == "__main__":
         raise FileNotFoundError(f"Anchors CSV not found: {unc_csv}")
 
     up_list = load_uncertain_points(unc_csv)
-
-
-    # BSPC PATCH: normalize X to a numeric list in case it was saved as a string in CSV
-    n_bad_x = 0
-    for _u in up_list:
-        try:
-            _x = _parse_X_value(_u.get("X", None), anchor=_u)
-            if _x is None:
-                n_bad_x += 1
-            else:
-                _u["X"] = _x
-        except Exception:
-            n_bad_x += 1
-    if n_bad_x > 0:
-        logger.warning("Parsed anchors: %d/%d have invalid/unparsed X; they may fail later.", n_bad_x, len(up_list))
-    logger.info("Loaded %d anchors from %s", len(up_list), unc_csv)
+    logger.info("Loaded %d anchors from %s", len(up_list), unc_csv)   
 
     # Attach metadata if available:
     #  - default uncertain run: use uncertain_full_ext.csv
@@ -2815,6 +3417,53 @@ if __name__ == "__main__":
         logger.info("Anchor filters applied: %d -> %d", up_list_before, len(up_list_filt))
     up_list = up_list_filt
 
+    # --- BSPC Option A: relative "high-confidence" cohort via pmax quantile / top-K ---
+    # Applied AFTER the absolute filters above (pred/true/accepted/pmax_min/pmax_max).
+    q_pmax = float(getattr(args, "filter_pmax_quantile", -1.0))
+    topk_pmax = int(getattr(args, "filter_pmax_topk", 0) or 0)
+
+    if (0.0 < q_pmax < 1.0) or (topk_pmax > 0):
+
+        def _get_pmax(u: Dict[str, Any]) -> float:
+            # primary: 'pmax' column (from *_ext.csv or anchors CSV)
+            pm = _safe_float(u.get("pmax", np.nan))
+            # fallback: from p1/p2 if present
+            if not np.isfinite(pm):
+                p1 = _safe_float(u.get("p1", np.nan))
+                p2 = _safe_float(u.get("p2", np.nan))
+                if np.isfinite(p1) and np.isfinite(p2):
+                    pm = float(max(p1, p2))
+            return float(pm) if np.isfinite(pm) else float("nan")
+
+        pvals = np.asarray([_get_pmax(u) for u in up_list], dtype=float)
+        pvals = pvals[np.isfinite(pvals)]
+
+        if pvals.size == 0:
+            logger.warning("[BSPC] pmax-quantile/topK requested but pmax is NaN for all anchors -> skipping.")
+        else:
+            before = len(up_list)
+
+            # Quantile threshold: keep pmax >= thr (computed within the already-filtered cohort)
+            if 0.0 < q_pmax < 1.0:
+                thr = float(np.quantile(pvals, q_pmax))
+                up_new = []
+                for u in up_list:
+                    pm = _get_pmax(u)
+                    if np.isfinite(pm) and pm >= thr:
+                        up_new.append(u)
+                up_list = up_new
+                logger.info("[BSPC] Applied pmax-quantile: q=%.3f -> thr=%.6f | %d -> %d",
+                            q_pmax, thr, before, len(up_list))
+                before = len(up_list)
+
+            # Top-K by pmax (highest confidence within cohort)
+            if topk_pmax > 0 and len(up_list) > topk_pmax:
+                up_list = sorted(up_list, key=lambda u: _get_pmax(u), reverse=True)[:topk_pmax]
+                logger.info("[BSPC] Applied pmax top-K: K=%d | %d -> %d", topk_pmax, before, len(up_list))
+
+    # -------------------------------------------------------------------------------
+
+
     # If requested: analyze exactly review_budget points (top-k by rank_by).
     # This only makes semantic sense for uncertain_full.csv (VAL-selected review set).
     if bool(getattr(args, "use_review_budget", False)) and use_default_uncertain:
@@ -2823,14 +3472,15 @@ if __name__ == "__main__":
         else:
             logger.info("Using review_budget=%d (exact count) for point selection.", review_budget)
             args.max_points = int(review_budget)
-            args.selection = "worst_margin" if (rank_by == "margin") else "worst_pmax"
+            # Selection key is driven by rank_by in score_key(); keep selection valid.
+            args.selection = "worst_margin"
             logger.info("Auto-set: --max_points=%d, --selection=%s", args.max_points, args.selection)
 
     # ----------------------------------------------------------------------
     # 2b) Calibration-shift diagnostics (up_real probs vs raw model softmax)
     # ----------------------------------------------------------------------
     try:
-        X_unc = np.asarray([u.get("X") for u in up_list], dtype=np.float32)
+        X_unc = np.asarray([_anchor_to_xstar(u) for u in up_list], dtype=np.float32)
 
         logits_np, probs_raw_np, probs_cal_np = predict_logits_and_proba(model, X_unc, device, cal=cal)
 
@@ -3067,6 +3717,41 @@ if __name__ == "__main__":
 
             })
         pd.DataFrame(rows).to_csv(os.path.join(OUT_DIR, "selected_uncertain_points.csv"), index=False)
+        
+
+        sel_df = pd.DataFrame(rows)
+
+        # Ensure a canonical point id for downstream joins (alias of pp_id).
+        if "point" not in sel_df.columns and "pp_id" in sel_df.columns:
+            sel_df.insert(0, "point", pd.to_numeric(sel_df["pp_id"], errors="coerce").astype("Int64"))
+
+        # Attach run-level settings for reproducibility / downstream analyses.
+        sel_df["attack_radius"] = float(getattr(args, "attack_radius", np.nan))
+        sel_df["robust_steps"] = int(getattr(args, "robust_steps", 0)) if getattr(args, "robust_steps", None) is not None else np.nan
+        sel_df["robust_num_random"] = int(getattr(args, "robust_num_random", 0)) if getattr(args, "robust_num_random", None) is not None else np.nan
+
+        sel_df.to_csv(os.path.join(OUT_DIR, "selected_uncertain_points.csv"), index=False)
+
+        # Record-level summary (detects record-dominance / shift effects early).
+        try:
+            if "record" in sel_df.columns:
+                tmp = sel_df.copy()
+                if "is_error" in tmp.columns:
+                    tmp["is_error"] = pd.to_numeric(tmp["is_error"], errors="coerce").fillna(0).astype(int)
+                if "pmax" in tmp.columns:
+                    tmp["pmax"] = pd.to_numeric(tmp["pmax"], errors="coerce")
+                rs = (tmp.groupby("record")
+                        .agg(n=("record","size"),
+                             n_err=("is_error","sum") if "is_error" in tmp.columns else ("record","size"),
+                             base_rate=("is_error","mean") if "is_error" in tmp.columns else ("record","size"),
+                             pmax_min=("pmax","min") if "pmax" in tmp.columns else ("record","size"),
+                             pmax_median=("pmax","median") if "pmax" in tmp.columns else ("record","size"),
+                             pmax_max=("pmax","max") if "pmax" in tmp.columns else ("record","size"))
+                        .reset_index())
+                rs.to_csv(os.path.join(OUT_DIR, "record_summary.csv"), index=False)
+        except Exception as e:
+            logger.warning("Failed to write record_summary.csv: %s", e)
+
     except Exception as e:
         logger.warning("Failed to write selected_uncertain_points.csv: %s", e)
 
@@ -3875,7 +4560,7 @@ if __name__ == "__main__":
             v = np.asarray(v, dtype=np.float32)
             n = np.linalg.norm(v)
             if not np.isfinite(n) or n < 1e-12:
-                return None
+                return float(r_max)
             v = v / n
 
             def _pred_label(x_np: np.ndarray) -> int:
@@ -3901,7 +4586,7 @@ if __name__ == "__main__":
                     lo = float(r - (rs[1]-rs[0]))
                     break
             if hi is None:
-                return None
+                return float(r_max)
 
             # binary search refine
             for _ in range(20):
@@ -3957,16 +4642,22 @@ if __name__ == "__main__":
 
 
         g = x_t.grad.detach().cpu().numpy().reshape(-1)
-        grad_dir = g if np.linalg.norm(g) > 1e-12 else None
+        grad_norm_eff = float(np.linalg.norm(g))
+        grad_dir = g if grad_norm_eff > 1e-12 else None
+
+        # r_max used for censoring when no flip is found along a ray
+        r_max_eff = float(RADIUS_ATTACK) if "RADIUS_ATTACK" in locals() else max(float(DELTA_LOCAL), 0.05)
 
         E = np.eye(4, dtype=np.float32)
         def _min_flip_two_sides(vec):
-            r_max_eff = float(RADIUS_ATTACK) if "RADIUS_ATTACK" in locals() else max(float(DELTA_LOCAL), 0.05)
             r1 = _flip_radius_along_vector(model, xstar, vec, device, cal, r_max=r_max_eff, steps=ROBUST_STEPS)
-            r2 = _flip_radius_along_vector(model, xstar, -vec, device, cal, r_max=r_max_eff, steps=60)
-
-            vals = [r for r in [r1, r2] if r is not None]
-            return (min(vals) if vals else None)
+            r2 = _flip_radius_along_vector(model, xstar, -vec, device, cal, r_max=r_max_eff, steps=ROBUST_STEPS)
+            # Treat missing as censored at r_max_eff (deployment-safe semantics).
+            if r1 is None:
+                r1 = float(r_max_eff)
+            if r2 is None:
+                r2 = float(r_max_eff)
+            return float(min(r1, r2))
 
         flip_grad = _min_flip_two_sides(grad_dir) if grad_dir is not None else None
         flip_lime = _min_flip_two_sides(E[axis_lime]) if axis_lime is not None else None
@@ -3983,7 +4674,10 @@ if __name__ == "__main__":
         idx_shap = _clamp_index(axis_shap, len(E))
         flip_shap = _min_flip_two_sides(E[idx_shap]) if idx_shap is not None else None
 
-
+        # Flags: whether a flip was observed within r_max_eff (vs censored at r_max_eff)
+        flip_grad_found = (None if flip_grad is None else int(np.isfinite(flip_grad) and float(flip_grad) < r_max_eff - 1e-12))
+        flip_lime_found = (None if flip_lime is None else int(np.isfinite(flip_lime) and float(flip_lime) < r_max_eff - 1e-12))
+        flip_shap_found = (None if flip_shap is None else int(np.isfinite(flip_shap) and float(flip_shap) < r_max_eff - 1e-12))
 
         # 7b. Axis-baseline ray sweeps 
         axis_report_str = (
@@ -4041,6 +4735,17 @@ if __name__ == "__main__":
             "cpu_rss_mb_delta": float("nan"),
             "gpu_peak_mb": float("nan"),
         }
+
+        # NOTE: even if --skip_benchmark is enabled, we already computed an effective gradient norm
+        # in the axis-baseline block (grad_norm_eff). Persist it so downstream triage can compare
+        # Puiseux scores vs cheap gradient baselines without re-running the full benchmark.
+        try:
+            if 'grad_norm_eff' in locals() and np.isfinite(grad_norm_eff):
+                sal["grad_norm"] = float(grad_norm_eff)
+        except Exception:
+            pass
+
+
 
         # (F) Resource benchmark (Puiseux vs gradient saliency)
         if getattr(args, "skip_benchmark", False):
@@ -4220,11 +4925,8 @@ if __name__ == "__main__":
 
 
             
-            # --- Dominant-ratio heuristic (r_dom) and observed flip radius ---
-            # We estimate when quartic terms overtake quadratic curvature: 
-            # r_dom ≈ sqrt(max|c2| / max|c4|), where c2 and c4 are coefficients of x^2 and x^4
-            # across all Puiseux branches. We also extract the minimal observed flip radius r_flip
-            # from the robustness table above.
+            # --- Dominant-ratio heuristic (legacy c2/c4) + Puiseux term-spectrum (fractional powers) ---
+            term_meta = puiseux_term_metrics_from_interpret(interpret_results, x_sym=x_sym, y_sym=y_sym)
             try:
                 # 1) Parse Puiseux expressions into SymPy and collect coefficients
                 exprs = []
@@ -4234,7 +4936,7 @@ if __name__ == "__main__":
                         e = sympy.expand(expr_repr)
                     else:
                         # robust to string formatting
-                        e = sympy.expand(sympy.sympify(str(expr_repr)))
+                        e = sympy.expand(sympy.sympify(str(expr_repr), locals={"x": x_sym, "y": y_sym, "I": sympy.I}))
                     exprs.append(e)
 
                 max_abs_c2 = 0.0
@@ -4259,6 +4961,17 @@ if __name__ == "__main__":
                 max_abs_c4 = float("nan")
                 r_dom = float("nan")
 
+            # Pull robust Puiseux term-spectrum numbers (works for fractional exponents)
+            pu_branch_count = int(term_meta.get("puiseux_branch_count", 0))
+            pu_has_fractional = int(term_meta.get("puiseux_has_fractional", 0))
+            pu_lead_exp_min = float(term_meta.get("puiseux_lead_exp_min", float("nan")))
+            pu_next_exp_min = float(term_meta.get("puiseux_next_exp_min", float("nan")))
+            pu_gap_min = float(term_meta.get("puiseux_gap_min", float("nan")))
+            pu_c_lead_max_abs = float(term_meta.get("puiseux_c_lead_max_abs", float("nan")))
+            pu_c_next_max_abs = float(term_meta.get("puiseux_c_next_max_abs", float("nan")))
+            pu_r_onset_min = float(term_meta.get("puiseux_r_onset_min", float("nan")))
+            pu_r_onset_med = float(term_meta.get("puiseux_r_onset_median", float("nan")))                
+
             # 2) Observed minimal flip radius from robustness results_table
             try:
                 r_flip_candidates = [row["changed_radius"] for row in results_table
@@ -4279,19 +4992,37 @@ if __name__ == "__main__":
             f_out.write("      Observed min flip radius r_flip = "
                         f"{('N/A' if np.isnan(r_flip) else f'{r_flip:.6f}')}\n\n")
 
+            f_out.write("      Puiseux term-spectrum (first two nonzero terms per branch):\n")
+            f_out.write(f"         branches={pu_branch_count}, has_fractional={pu_has_fractional}\n")
+            f_out.write(f"         r_onset_min={pu_r_onset_min:.6f}, r_onset_median={pu_r_onset_med:.6f}\n")
+            f_out.write(f"         lead_exp_min={pu_lead_exp_min:.6f}, next_exp_min={pu_next_exp_min:.6f}, gap_min={pu_gap_min:.6f}\n")
+            f_out.write(f"         |c_lead|max={pu_c_lead_max_abs:.6g}, |c_next|max={pu_c_next_max_abs:.6g}\n\n")                        
+
             # 4) Collect for a CSV summary across all anchors
             dom_rows.append([
                 i,
                 max_abs_c2,
                 max_abs_c4,
                 r_dom,
+                pu_branch_count,
+                pu_has_fractional,
+                pu_lead_exp_min,
+                pu_next_exp_min,
+                pu_gap_min,
+                pu_c_lead_max_abs,
+                pu_c_next_max_abs,
+                pu_r_onset_min,
+                pu_r_onset_med,                
                 flip_found,
                 r_flip,          # r_flip_obs = observed min flip radius (NaN if no flip found <= RADIUS_ATTACK)
                 r_flip_cens,     # r_flip_cens = censored at RADIUS_ATTACK when no flip found
-                flip_grad if flip_grad is not None else np.nan,
-                flip_lime if flip_lime is not None else np.nan,
-                flip_shap if flip_shap is not None else np.nan,
-                float(sal.get("grad_norm", np.nan)),
+                float(flip_grad) if flip_grad is not None else np.nan,
+                (float(flip_grad_found) if flip_grad_found is not None else np.nan),
+                float(flip_lime) if flip_lime is not None else np.nan,
+                (float(flip_lime_found) if flip_lime_found is not None else np.nan),
+                float(flip_shap) if flip_shap is not None else np.nan,
+                (float(flip_shap_found) if flip_shap_found is not None else np.nan),
+                (float(grad_norm_eff) if ('grad_norm_eff' in locals() and np.isfinite(grad_norm_eff)) else float(sal.get("grad_norm", np.nan))),
                 float(kdiag.get("frac_kink", np.nan)),
             ])
 
@@ -4431,12 +5162,24 @@ if __name__ == "__main__":
             "c2_max_abs",
             "c4_max_abs",
             "r_dom",
+            "puiseux_branch_count",
+            "puiseux_has_fractional",
+            "puiseux_lead_exp_min",
+            "puiseux_next_exp_min",
+            "puiseux_gap_min",
+            "puiseux_c_lead_max_abs",
+            "puiseux_c_next_max_abs",
+            "puiseux_r_onset_min",
+            "puiseux_r_onset_median",            
             "flip_found",
             "r_flip_obs",
             "r_flip_cens",
             "flip_grad",
+            "flip_grad_found",
             "flip_lime",
+            "flip_lime_found",
             "flip_shap",
+            "flip_shap_found",
             "saliency_grad_norm",
             "frac_kink",
         ]).to_csv(os.path.join(OUT_DIR, "dominant_ratio_summary.csv"), index=False)

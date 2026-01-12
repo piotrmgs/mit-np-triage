@@ -1,25 +1,25 @@
-name: puiseux-cvnn          
+name: mitbih-np-triage
 channels:
-  - pytorch                
+  - pytorch
   - conda-forge
 dependencies:
   - python=3.10
   - pip
-  - pytorch                
+  - pytorch
   - torchvision
   - torchaudio
   - numpy
   - scipy
   - pandas
   - scikit-learn
+  - umap-learn
   - sympy
   - matplotlib
   - tqdm
   - seaborn
-  - psutil 
+  - psutil
   - pip:
     - torch-complex
     - lime
     - shap
     - wfdb
-

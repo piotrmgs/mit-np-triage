@@ -11,7 +11,7 @@ This repository implements a **post-hoc audit / triage pipeline** for ECG classi
 ## Repository layout
 
 - `up_real/`  
-  Training + calibration + export of full-test predictions for MIT–BIH (Normal vs PVC) with record-wise (patient-wise) splits.
+  Training + calibration + export of full-test predictions for MIT-BIH (Normal vs PVC) with record-wise (patient-wise) splits.
 
 - `post_processing_real/`  
   Cohort construction (uncertain vs high-confidence accept), per-record balanced sampling, local surrogate fitting, Newton–Puiseux coefficient extraction, and per-score triage evaluation inputs.
@@ -34,7 +34,7 @@ This repository implements a **post-hoc audit / triage pipeline** for ECG classi
 ├── mit_bih_pre/                  # Preprocessing scripts for MIT‑BIH
 │   └── pre_pro.py                # Signal filtering and feature extraction
 ├── src/                          # Core library modules
-│   ├── post_processing.py        # Post‑processing (common)
+│   ├── post_processing.py        # Post‑processing
 │   ├── find_up_synthetic.py      # Uncertainty mining on synthetic data
 │   ├── find_up_real.py           # Uncertainty mining on MIT‑BIH data
 │   ├── local_analysis.py         # Local surrogate + Puiseux wrapper
@@ -76,7 +76,7 @@ This repository implements a **post-hoc audit / triage pipeline** for ECG classi
    * Go to <https://physionet.org/content/mitdb/1.0.0/>  
    * Download all files and unzip them into `mit-bih/`.
 
-**Licence notice:**  
+**License notice:**  
 MIT-BIH data are released under the PhysioNet open-access license.  
 By downloading the files you agree to its terms.
 
@@ -311,6 +311,12 @@ python -m post_processing_real.post_processing_real \
 ---
 
 ## Where to find the “paper numbers” after running
+
+- Per-seed outputs are written to:
+  - `results/bspc_seedSEED/` (training + full_test_predictions_ext.csv)
+  - `results/bspc_pp_uncertain_perrec_seedSEED_n1000/` and `results/bspc_pp_highconf_accept_p95_perrec_seedSEED_n1000/` (cohort construction + per-anchor analysis)
+  - `results/NP_bspc_seedSEED_n1000/` and `results/NP_bspc_seedSEED_n1000_clusterboot/` (paper-ready AUPRC + curves + bootstrap sensitivity)
+
 
 - Across-seed AUPRC table:  
   `results/NP_bspc_across_seeds_n1000/auprc_across_seeds.csv`

@@ -1,4 +1,4 @@
-# Copyright (c) 2025 Piotr Migus
+# Copyright (c) 2026 Piotr Migus
 # This code is licensed under the MIT License.
 # See the LICENSE file in the repository root for full license information.
 
@@ -48,7 +48,7 @@ import hashlib
 import inspect
 import bisect
 from datetime import datetime, timezone
-# psutil is optional (do not hard-fail if reviewers don't have it installed)
+
 try:
     import psutil
 except Exception:
@@ -75,7 +75,7 @@ from sklearn.decomposition import PCA
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-# Ensure PDF text is editable (avoid Type 3 fonts) for paper figures.
+# Ensure PDF text is editable (avoid Type 3 fonts)
 matplotlib.rcParams["pdf.fonttype"] = 42
 matplotlib.rcParams["ps.fonttype"] = 42
 
@@ -121,7 +121,6 @@ from src.find_up_real import (
 def _maybe_enable_faulthandler(out_dir: str, timeout_s: int, logger: logging.Logger):
     """
     If timeout_s > 0, periodically dumps Python stack traces to faulthandler.log.
-    This is extremely useful for diagnosing apparent "hangs" (CPU-bound loops, stuck optimizer, etc.).
     Returns an open file handle that MUST stay alive for the duration of the run.
     """
     if not timeout_s or int(timeout_s) <= 0:
@@ -223,7 +222,7 @@ def _get_calibrator_compat(
 def _safe_train_val_split(X, y, test_size: float, seed: int, logger: logging.Logger = None, tag: str = "train/val"):
     """
     Try stratified train/val split, but if it is impossible (single-class, too few positives, etc.),
-    fall back to an unstratified split so the paper run never crashes.
+    fall back to an unstratified split 
     """
     try:
         return train_test_split(
@@ -259,7 +258,7 @@ def _ensure_embed_method_available(embed_method: str, logger: logging.Logger) ->
 
 def _save_joint_pca_scatter(X: np.ndarray, y: np.ndarray, out_dir: str, *, fname: str = "complex_PCA_scatter.png", save_pdf: bool = True):
     """
-    Paper-safe replacement for the old 'real PC1 vs imag PC1' plot:
+    replacement for the old 'real PC1 vs imag PC1' plot:
     joint PCA on the full feature vector (Re+Im) -> PC1 vs PC2.
     """
     X = np.asarray(X, dtype=float)
@@ -692,7 +691,7 @@ def parse_args():
         help="Disable saving PDF copies of figures.",
     )
 
-    # ▼▼▼ Grid-based (tau/delta) sensitivity analysis + heatmaps — ENABLED by default ▼▼▼
+    # Grid-based (tau/delta) sensitivity analysis + heatmaps
     parser.add_argument(
         "--sensitivity",
         action="store_true",
@@ -853,7 +852,7 @@ def parse_args():
         help="Save lightweight .npz arrays (predictions/probabilities) (ON by default).",
     )
 
-    # Per-sample CV predictions CSV (VERY large; can dominate runtime)
+    # Per-sample CV predictions CSV
     parser.add_argument(
         "--save-pred-csv",
         dest="save_pred_csv",
@@ -1157,10 +1156,7 @@ def _write_artifact_manifest(out_dir: str, logger: logging.Logger, hash_files: b
         logger.warning("Failed to write artifact manifest: %s", e)
 
 def _write_artifact_readme(out_dir: str, args, logger: logging.Logger):
-    """
-    Create a human-readable ARTIFACTS.md that explains key outputs.
-    Useful when packaging a supplementary ZIP for reviewers.
-    """
+
     try:
         key_files = [
             ("run_args.json", "Exact CLI arguments for this run."),
@@ -1314,8 +1310,8 @@ def _selective_metrics_binary(y_true: np.ndarray, probs: np.ndarray, tau: float,
     tp_auto = int((pos & accept & (pred == 1)).sum())
     tn_auto = int((neg & accept & (pred == 0)).sum())
 
-    fn_auto_rate = (fn_auto / n_pos) if n_pos > 0 else float("nan")  # missed PVC among ALL PVC
-    fp_auto_rate = (fp_auto / n_neg) if n_neg > 0 else float("nan")  # false alarms among ALL normal
+    fn_auto_rate = (fn_auto / n_pos) if n_pos > 0 else float("nan")  
+    fp_auto_rate = (fp_auto / n_neg) if n_neg > 0 else float("nan")  
     tp_auto_rate = (tp_auto / n_pos) if n_pos > 0 else float("nan")
     tn_auto_rate = (tn_auto / n_neg) if n_neg > 0 else float("nan")
 
@@ -1675,7 +1671,7 @@ def main():
         os.remove(sum_multi_path)
 
     
-    # logging
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
@@ -1683,7 +1679,7 @@ def main():
             logging.FileHandler(os.path.join(args.output_folder, "run.log"), mode="w"),
             logging.StreamHandler(),
         ],
-        force=True,  # ensure reconfiguration even if logging was set elsewhere
+        force=True,  
     )
 
 
@@ -1692,7 +1688,7 @@ def main():
     if run_id_original and args.run_id != run_id_original:
         logger.warning("Sanitized run_id: %r -> %r", run_id_original, args.run_id)
 
-    # Route Python warnings through logging (paper runs: warnings are captured in run.log)
+
     logging.captureWarnings(True)
     warnings.simplefilter("default")
 
@@ -1719,7 +1715,7 @@ def main():
         args.num_workers = 0
 
 
-    # Persist CLI args for exact reproducibility (paper appendices / rebuttals)
+    # Persist CLI args for exact reproducibility
     try:
         with open(os.path.join(args.output_folder, "run_args.json"), "w") as f:
             json.dump(vars(args), f, indent=2, sort_keys=True)
@@ -1814,7 +1810,7 @@ def main():
     except Exception as _e:
         logger.warning("Could not write run_meta.json: %s", _e)
 
-    # Environment snapshot (pip freeze) — strongly recommended for BSPC / Elsevier reproducibility
+    # Environment snapshot
     if args.save_env:
         _try_write_pip_freeze(args.output_folder, logger)
 
@@ -1866,7 +1862,7 @@ def main():
     fold_metrics_ext_rows = []
    
 
-    # NEW: CV selective triage collectors (per-fold; thresholds selected on VAL, evaluated on TEST)
+    # CV selective triage collectors (per-fold; thresholds selected on VAL, evaluated on TEST)
     cv_sel_budget_count_rows = []
     cv_triage_curve_rows = []
 
@@ -1902,7 +1898,7 @@ def main():
 
     record_has_pos = np.asarray(record_has_pos, dtype=int)
 
-    # NEW: drop records that yielded zero windows (prevents degenerate folds & confusing splits)
+    # drop records that yielded zero windows (prevents degenerate folds & confusing splits)
     try:
         valid_mask = np.asarray([int(s.get("n_windows", 0)) > 0 for s in record_window_stats], dtype=bool)
         if not bool(valid_mask.all()):
@@ -1929,11 +1925,11 @@ def main():
         )
 
 
-    # NEW: stratify by pos_frac bins (reduces fold-to-fold prior shift vs has_pos)
+    # stratify by pos_frac bins (reduces fold-to-fold prior shift vs has_pos)
     record_pos_frac = np.asarray([s.get("pos_frac", 0.0) for s in record_window_stats], dtype=float)
     record_strata, strat_desc = _make_pos_frac_strata(record_pos_frac, n_splits=int(args.folds), max_bins=4)
 
-    # Store stratum id in stats CSV (nice for debugging / rebuttals)
+    # Store stratum id in stats CSV
     try:
         for s, b in zip(record_window_stats, record_strata.tolist()):
             s["strat_bin"] = int(b)
@@ -1975,7 +1971,7 @@ def main():
             args.data_folder, test_recs, WINDOW_SIZE, PRE_SAMPLES, FS
         )
 
-        # Record sample-level stats in the split manifest (helps debugging / rebuttals)
+        # Record sample-level stats in the split manifest
         try:
             stats_tr = _log_label_stats(logger, f"Fold {fold} TRAIN(raw)", y_train)
             stats_te = _log_label_stats(logger, f"Fold {fold} TEST(raw)",  y_test)
@@ -2029,7 +2025,7 @@ def main():
             pin_memory=args.pin_memory,
         )
 
-        # Zapisz scaler dla tego folda (przyda się w postprocessingu)
+        
         with open(os.path.join(args.output_folder, f"scaler_fold{fold}.pkl"), "wb") as f:
             pickle.dump(scaler, f)
 
@@ -2086,7 +2082,7 @@ def main():
         iso_cal = None
         cal_fn = None          # platt/beta/vector apply function from get_calibrator
         cal_kind = None        # "logits" or "probs"
-        cal_tag = ""           # tag string from get_calibrator (for logging)
+        cal_tag = ""           # tag string from get_calibrator 
         is_binary = False
 
         main_cal = str(args.calibration).strip().lower()
@@ -2100,7 +2096,7 @@ def main():
             val_has_both = True  # best-effort; let calibrator try
 
         if main_cal == "temperature":
-            # Paper-ready temperature scaling: fast (logits cached), safe (positive + clamped), CVNN-correct.
+            # temperature scaling: fast (logits cached), safe (positive + clamped), CVNN-correct.
             try:
                 if not val_has_both:
                     logger.warning("[Fold %d] VAL has a single class -> using T=1.0 (no-op temperature).", fold)
@@ -2292,7 +2288,6 @@ def main():
             pass
 
         # Optional per-sample CSV export (STREAMING, no giant in-memory dicts)
-        # NOTE: This section was a common source of "hang" (CPU-bound) in paper runs.
         if pred_csv_writer is not None:
             t_write0 = time.perf_counter()
             probs_ts_np = probs_ts_all.numpy()
@@ -2362,9 +2357,7 @@ def main():
         br_raw_folds.append(br_raw);   br_ts_folds.append(br_ts)
 
         # ─────────────────────────────────────────────────────────────
-        # NEW: CV selective triage (thresholds selected on VAL, evaluated on TEST)
-        # This makes the selective-risk/capture story paper-ready (mean±CI across folds),
-        # instead of relying on a single FULL split.
+        # CV selective triage (thresholds selected on VAL, evaluated on TEST)
         # ─────────────────────────────────────────────────────────────
         try:
             # Compute calibrated probabilities on VAL (same calibration as TEST in this fold)
@@ -2469,7 +2462,7 @@ def main():
         )
 
 
-        # Extended per-fold row (single place for paper tables)
+        # Extended per-fold row 
         fold_metrics_ext_rows.append({
             "fold": int(fold),
             "calibration": cal_suffix_fold,
@@ -2495,8 +2488,8 @@ def main():
             "Brier_cal": float(br_ts),
         })        
 
-        # ========== NEW: multi-calibration block (runs in addition to RAW vs selected --calibration) ==========
-        # Deduplicate + validate methods (paper runs: avoid accidental double-work / typos)
+        # ========== multi-calibration block (runs in addition to RAW vs selected --calibration) ==========
+
         allowed_methods = {"platt", "beta", "vector", "temperature", "isotonic", "none", "raw"}
         methods = []
         for _m in str(args.calibs).split(","):
@@ -2719,10 +2712,10 @@ def main():
                 w.writeheader()
             w.writerows(fold_rows)
         logging.info(f"[Fold {fold}] Wrote multi-calibration rows to {multi_path}")
-        # ========== /NEW ==========
+        
 
 
-        # Best-effort cleanup between folds (helps long paper runs on GPUs)
+        # Best-effort cleanup between folds
         try:
             if device.type == "cuda":
                 torch.cuda.empty_cache()
@@ -2739,7 +2732,7 @@ def main():
         logger.warning("[CV] Failed to save cv_record_splits.json: %s", e)
 
 
-    # NEW: fold-level window distribution table (super useful for paper FULL split sanity)
+    # fold-level window distribution table
     try:
         fold_stats_path = os.path.join(args.output_folder, "cv_fold_window_stats.csv")
         with open(fold_stats_path, "w", newline="") as f:
@@ -2754,7 +2747,7 @@ def main():
     except Exception as e:
         logger.warning("[CV] Failed to save cv_fold_window_stats.csv: %s", e)
 
-    # NEW: save CV selective triage artifacts (per-fold + summary)
+    # save CV selective triage artifacts (per-fold + summary)
     try:
         if cv_sel_budget_count_rows:
             p = os.path.join(args.output_folder, "cv_selective_budget_count_per_fold.csv")
@@ -2771,7 +2764,7 @@ def main():
                 w.writerows(cv_triage_curve_rows)
             logger.info("[CV] Saved %s", p)
 
-        # NEW: aggregate CV triage curve across folds (mean ± CI95) + paper-ready plots
+        # aggregate CV triage curve across folds (mean ± CI95)
         try:
             if cv_triage_curve_rows:
                 # group by budget_frac_val
@@ -2904,7 +2897,7 @@ def main():
     logger.info("Saved per-fold CV metrics to %s", per_fold_path)
 
 
-    # NEW: extended per-fold metrics (performance + calibration) for paper tables
+    # extended per-fold metrics (performance + calibration)
     if fold_metrics_ext_rows:
         ext_path = os.path.join(args.output_folder, "cv_metrics_per_fold_extended.csv")
         with open(ext_path, "w", newline="") as f:
@@ -2914,7 +2907,7 @@ def main():
             w.writerows(fold_metrics_ext_rows)
         logger.info("Saved extended per-fold metrics to %s", ext_path)
 
-        # NEW: performance summary (mean ± CI95)
+        # performance summary (mean ± CI95)
         perf_sum_path = os.path.join(args.output_folder, "cv_metrics_summary_perf.csv")
         with open(perf_sum_path, "w", newline="") as f:
             w = csv.writer(f)
@@ -2952,7 +2945,7 @@ def main():
     else:
         logger.info("Calibration='none' -> skipping second calibration curve (RAW already saved).")
 
-    # NEW: pooled CV TEST diagnostics (paper-friendly TXT + figure)
+    # pooled CV TEST diagnostics 
     try:
         metrics_cv, cm_cv, roc_cv, pr_cv = _compute_binary_metrics_and_curves(
             np.asarray(y_true_all, dtype=int),
@@ -2960,7 +2953,7 @@ def main():
             np.asarray(y_prob_all_pos, dtype=float),
         )
 
-        # Add pooled calibration metrics (RAW vs CAL) into the TXT (important for BSPC reviewers)
+        # Add pooled calibration metrics (RAW vs CAL) into the TXT
         try:
             ece_pool_raw = expected_calibration_error(np.asarray(y_true_all_raw, dtype=int), np.asarray(y_prob_all_pos_raw, dtype=float), n_bins=int(args.ece_bins))
             ece_pool_cal = expected_calibration_error(np.asarray(y_true_all, dtype=int), np.asarray(y_prob_all_pos, dtype=float), n_bins=int(args.ece_bins))
@@ -2998,7 +2991,7 @@ def main():
     except Exception as e:
         logger.warning("Failed to save pooled CV diagnostics: %s", e)
 
-    # NEW: pooled CV uncertainty histograms (pmax + margin)
+    # pooled CV uncertainty histograms (pmax + margin)
     try:
         # pmax
         fig, ax = plt.subplots(figsize=(5.2, 3.2))
@@ -3029,7 +3022,7 @@ def main():
     except Exception as e:
         logger.warning("Failed to save pooled CV uncertainty histograms: %s", e)
 
-    # NEW: persist lightweight arrays for downstream analysis
+    # persist lightweight arrays for downstream analysis
     if args.save_arrays:
         try:
             np.savez_compressed(
@@ -3071,7 +3064,7 @@ def main():
     logger.info("Saved CV metrics summary with 95%% CI to %s",
                 os.path.join(args.output_folder, "cv_metrics_summary.csv"))
 
-    # ========== NEW: global summary for multi-calibration ==========
+    # ========== global summary for multi-calibration ==========
     multi_path = os.path.join(args.output_folder, "cv_metrics_per_fold_multi.csv")
     if os.path.exists(multi_path):
         try:
@@ -3140,7 +3133,7 @@ def main():
 
     if not args.full_retrain:
         logger.info("Skipping FULL retrain stage (--no-full-retrain).")
-        # Still generate paper-friendly artifact index/manifest for CV-only runs
+
         try:
             _write_artifact_readme(args.output_folder, args, logger)
         except Exception as _e:
@@ -3170,13 +3163,11 @@ def main():
     logger.info("Retraining FULL model with patient-wise record split (no leakage)…")
 
     # Reconstruct the same record partitions used in CV (deterministic)
-    # We'll use fold 1 as TEST records and fold 2 as VAL records by convention.
-    # (You can later parametrize it with CLI if needed.)
     full_test_fold = int(args.full_test_fold)
     full_val_fold  = int(args.full_val_fold)
 
 
-    # NEW: optionally auto-select FULL folds to avoid extreme prior shift (label-only heuristic)
+    # optionally auto-select FULL folds to avoid extreme prior shift (label-only heuristic)
     if getattr(args, "auto_full_folds", False):
         try:
             # per-fold test pos_frac (from CV splits)
@@ -3468,14 +3459,14 @@ def main():
                 w.writerow([f"{row[0]:.6f}", f"{row[1]:.6f}"] + [f"{x:.6f}" for x in row[2:]] + [f"{float(k):.6f}"])
         logging.info("Saved sensitivity grid (with kink) to %s", sens_csv)
         
-        # === NEW: enriched grid with coverage + exact counts + clinically-relevant auto FN/FP ===
+        # === enriched grid with coverage + exact counts + clinically-relevant auto FN/FP ===
         sens_csv_ext = os.path.join(args.output_folder, "sens_grid_ext.csv")
         with open(sens_csv_ext, "w", newline="") as f:
             fieldnames = [
                 "tau","delta",
                 # original grid metrics (as returned)
                 "abstain_grid","capture_grid","precision_grid","dispersion_grid","risk_accept_grid","kink",
-                # exact recompute (robust for paper tables)
+                # exact recompute 
                 "n_total","n_accept","n_review","coverage_exact","abstain_exact",
                 "risk_accept_exact","capture_exact","precision_review_exact",
                 # clinical-style safety for PVC
@@ -3568,7 +3559,7 @@ def main():
 
 
     
-    # === NEW: thresholds for multiple review budgets (fractional) ===
+    # === thresholds for multiple review budgets (fractional) ===
     budget_fracs = _parse_float_csv(args.budget_fracs)
     budget_plans = []  # store tau/delta for later TEST evaluation
     if budget_fracs:
@@ -3675,7 +3666,7 @@ def main():
     n_classes = int(probs_te_np.shape[1])
 
 
-    # Optional: map global TEST indices back to record IDs (helps case studies / rebuttals)
+    # Optional
     test_rec_order = None
     test_cum_ends = None
     try:
@@ -3702,7 +3693,7 @@ def main():
             logger.info("[FULL] Saved index→record map -> %s", map_path)
 
             # Convenience export: row-wise TEST table (join-friendly: record/window/index + probs + features).
-            # Redundant with full_test_arrays.npz, but dramatically easier to consume in downstream triage / paper scripts.
+            # Redundant with full_test_arrays.npz
             try:
                 rec_list: List[int] = []
                 win_list: List[int] = []
@@ -3805,7 +3796,7 @@ def main():
     fig, ax = plt.subplots(figsize=(5.2, 3.2))
     ax.hist(y_margin_test, bins=30, alpha=0.75)
 
-    # Only draw delta* line if it is actually active (in our binary fast path delta*=0.0 by design)
+
     if float(delta_star) > 1e-9:
         ax.axvline(float(delta_star), linestyle="--", alpha=0.9, label=f"delta* = {float(delta_star):.4f}")
 
@@ -3823,13 +3814,13 @@ def main():
     plt.close(fig)
     logging.info("Saved uncertainty margin histogram -> %s", m_hist_path)
 
-    # 3) Full TEST confusion + ROC + PR (paper figure) + selective triage metrics
+    # 3) Full TEST confusion + ROC + PR + selective triage metrics
     try:
         metrics_full, cm_full, roc_full, pr_full = _compute_binary_metrics_and_curves(
             y_true_test, y_pred_test, y_prob_pos_test
         )
 
-        # Full TEST calibration metrics (RAW vs CAL) — makes rebuttals much easier
+        # Full TEST calibration metrics (RAW vs CAL)
         try:
             probs_raw_np_full = probs_raw_te.numpy()
             y_prob_pos_raw_full = probs_raw_np_full[:, 1].astype(float) if probs_raw_np_full.shape[1] == 2 else probs_raw_np_full[:, 0].astype(float)
@@ -3971,7 +3962,7 @@ def main():
     except Exception as _e:
         logger.warning("Failed to write uncertain_full_ext.csv: %s", _e)
 
-    # --- NEW: export FULL TEST predictions (all samples) for paper / post-processing on non-uncertain subsets ---
+    # --- export FULL TEST predictions (all samples) for post-processing on non-uncertain subsets ---
     # This enables analyses like: "high-confidence PVC predictions that are still fragile / error-prone".
     try:
         full_pred_path = os.path.join(args.output_folder, "full_test_predictions_ext.csv")
@@ -4039,7 +4030,7 @@ def main():
                     "X": [x0, x1, x2, x3],
                 })
 
-                # Per-record rollup (paper: record-level shift / drift)
+                # Per-record rollup
                 if rec:
                     st = rec_stats.setdefault(rec, {
                         "record": rec,
@@ -4177,7 +4168,7 @@ def main():
                     })
             logger.info("Saved TEST triage curve -> %s", out_curve)
 
-            # Simple paper-ready plots: risk vs coverage and capture vs abstain
+            # Simple plots: risk vs coverage and capture vs abstain
             data = []
             with open(out_curve, "r", newline="") as f:
                 rr = csv.DictReader(f)
@@ -4224,7 +4215,7 @@ def main():
 
     logger.info(f"[INFO] Saved full-model uncertain points to {csv_path}")
 
-    # Human-readable artifact index (helps packaging for reviewers)
+    # Human-readable artifact index
     _write_artifact_readme(args.output_folder, args, logger)
 
     # Final artifact manifest (quick audit + easy packaging)

@@ -47,6 +47,8 @@ This repository implements a **post-hoc audit / triage pipeline** for ECG classi
 │   └── post_processing_real.py
 ├── NP-analysis_real/             # Newton–Puiseux evidence & triage (MIT-BIH)
 │   └── NP-analysis_real.py
+├── environment.yml
+├── LICENSE
 └── README.md                     # This file
 ```
 

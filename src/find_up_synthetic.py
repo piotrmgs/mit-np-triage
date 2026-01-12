@@ -1,4 +1,4 @@
-# Copyright (c) 2025 Piotr Migus
+# Copyright (c) 2026 Piotr Migus
 # This code is licensed under the MIT License.
 # See the LICENSE file in the repository root for full license information.
 import torch
@@ -560,3 +560,4 @@ def visualize_uncertainty(model, X_data, y_data, uncertain_points, folder, thres
     plt.close()
     
     print(f"[INFO] Visualizations saved in folder: {folder}")
+

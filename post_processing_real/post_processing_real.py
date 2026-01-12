@@ -1,17 +1,27 @@
-# Copyright (c) 2025 Piotr Migus
+# Copyright (c) 2026 Piotr Migus
 # This code is licensed under the MIT License.
 # See the LICENSE file in the repository root for full license information.
 """
-Post-processing for MIT-BIH experiment:
-- Loads trained CVNN and uncertain anchors.
-- Fits local complex polynomial surrogates with robustness safeguards.
-- Computes Puiseux expansions + interpretation.
-- Robustness along adversarial directions.
-- LIME & SHAP explanations with optional temperature scaling.
-- Sensitivity analysis summary (tau, delta).
-- Comparative calibration table with 95% CI (+ Wilcoxon & win-rate).
-- Resource benchmark: Puiseux vs gradient saliency.
+Post-processing for MIT-BIH (real) run (`up_real` artifacts).
+
+Inputs (IN_DIR = resolved run folder):
+- Required: best_model_full.pt, uncertain_full.csv
+- Optional: uncertain_full_ext.csv (metadata), scaler_full.pkl, run_args.json/run_meta.json,
+           full_val_arrays.npz (to reconstruct calibration params), cv_*/full_test_* summaries.
+
+Outputs (OUT_DIR):
+- paper_summary.md, README_post_processing_real.md, post_processing_manifest.json, run_command.txt
+- Per-point: benchmark_point{i}.txt, local_surrogate_diag_point{i}.json, robustness_*.csv,
+             contour_*.png, resource_point{i}.txt
+- Aggregate: dominant_ratio_summary.csv, local_fit_summary.csv, kink_summary.csv, triage_error_*.{csv,png}
+
+Notes:
+- Reconstructs the calibrated decision system used by `up_real` (TEMPERATURE/PLATT/BETA/VECTOR/ISOTONIC)
+  before Puiseux/robustness/XAI, to keep plots and rankings consistent.
+- Optional deps: SHAP/LIME/SciPy (use --skip_shap/--skip_lime; stats degrade gracefully if SciPy missing).
+
 """
+
 
 import os
 import sys
@@ -102,7 +112,7 @@ def parse_pp_args():
     p.add_argument("--out_dir", type=str, default="")               # optional override
     p.add_argument("--seed", type=int, default=12345)
 
-    # Anchor selection (critical for paper workflow)
+    # Anchor selection
     p.add_argument("--max_points", type=int, default=30)
     p.add_argument("--selection", type=str, default="per_record_mixed",
                    choices=["per_record_mixed", "per_record_random", "worst_margin", "random"])
@@ -134,7 +144,7 @@ def parse_pp_args():
         help="Keep anchors with pmax <= this value (requires 'pmax' column). NaN disables.",
     )
 
-    # --- BSPC Option A: relative "high-confidence" cohort (quantile/top-K) ---
+    # --- Option A: relative "high-confidence" cohort (quantile/top-K) ---
     p.add_argument(
         "--filter_pmax_quantile",
         type=float,
@@ -164,12 +174,10 @@ def parse_pp_args():
     )    
 
     # How to rank "most uncertain" points when selection uses ordering.
-    # NOTE: lower = more uncertain for all supported keys.
     p.add_argument("--rank_by", type=str, default="margin",
                    choices=["margin", "pmax", "abs_logit", "abs_logit_cal"],
                    help="Ranking key for uncertainty ordering (lower = more uncertain).")
 
-    # Paper workflow toggles
     p.add_argument("--paper", action="store_true",
                    help="Write paper-ready summaries (markdown + tables) using up_real artifacts.")
     p.add_argument("--copy_figures", action="store_true",
@@ -225,7 +233,6 @@ def parse_pp_args():
         help="Small probe radius used inside find_adversarial_directions().",
     )    
 
-    # Paper-ready robustness knobs (auto-refit local surrogate when fidelity is low)
     p.add_argument(
         "--min_corr",
         type=float,
@@ -257,7 +264,6 @@ def parse_pp_args():
         help="Multiply exclude_kink_eps by this factor on each refit attempt.",
     )
 
-    # Bundle / packaging helpers (paper workflow)
     p.add_argument(
         "--zip_bundle",
         action="store_true",
@@ -307,8 +313,8 @@ from src.local_analysis import (
     puiseux_uncertain_point,
     load_uncertain_points,
     evaluate_poly_approx_quality,
-    estimate_nonholomorphic_fraction,      # NEW
-    benchmark_local_poly_approx_and_puiseux  # NEW
+    estimate_nonholomorphic_fraction,      
+    benchmark_local_poly_approx_and_puiseux  
 )
 from src.puiseux import puiseux_expansions  # for benchmark timing
 from src.find_up_real import compress_to_C2, WINDOW_SIZE, PRE_SAMPLES, FS  # constants + C^2 compression
@@ -423,10 +429,7 @@ def write_paper_summary_md(
     run_meta: Dict[str, Any],
     run_args: Dict[str, Any],
 ) -> None:
-    """
-    Build a single, paper-friendly markdown summary from up_real artifacts.
-    Copy-pasteable into appendix/supplement.
-    """
+
 
     def _f(x) -> float:
         try:
@@ -437,7 +440,6 @@ def write_paper_summary_md(
     def _md(df: Optional[pd.DataFrame]) -> str:
         """
         Render dataframe as a markdown table when possible; fallback to fixed-width text.
-        (Keeps paper_summary.md copy-paste friendly.)
         """
         if df is None or df.empty:
             return ""
@@ -511,7 +513,7 @@ def write_paper_summary_md(
             f"- embed_method: {run_args.get('embed_method')}, embed_max_points: {run_args.get('embed_max_points')}"
         )
 
-    # Full split records (important for shift / budget drift narrative)
+    # Full split records
     split = _read_json_optional(os.path.join(in_dir, "full_split_records.json"))
     if split:
         # up_real writes: train_records / val_records / test_records
@@ -521,10 +523,6 @@ def write_paper_summary_md(
     lines.append("")
 
 
-
-    # ------------------------------------------------------------------
-    # Key takeaways (for manuscript claims)
-    # ------------------------------------------------------------------
     lines.append("## Key takeaways (sanity-check vs manuscript claims)")
     lines.append("")
 
@@ -840,7 +838,7 @@ def write_paper_summary_md(
             lines.append("")
 
     # ------------------------------------------------------------------
-    # Full test calibration (raw vs calibrated) — IMPORTANT for narrative
+    # Full test calibration (raw vs calibrated)
     # ------------------------------------------------------------------
     df_full_calib = safe_read_csv(os.path.join(in_dir, "full_test_calibration_metrics.csv"))
     if df_full_calib is not None and len(df_full_calib):
@@ -1676,10 +1674,7 @@ def time_gradient_saliency_calibrated(
     }
 
 
-# ============================================================
-# Paper-ready bundle helpers: README + manifest + zip + checks
-# + calibrated robustness/contour plotting (PLATT shifts boundary!)
-# ============================================================
+
 
 _FEAT_NAMES_R4 = ["Re(z1)", "Re(z2)", "Im(z1)", "Im(z2)"]
 
@@ -2298,10 +2293,7 @@ def plot_xy_with_ci(
     ylabel: str,
     out_path: str,
 ) -> bool:
-    """
-    Minimal helper to generate paper convenience plots from CSV summaries.
-    Returns True if plot was created.
-    """
+
     if df is None or df.empty:
         return False
     if x_col not in df.columns or y_col not in df.columns:
@@ -2807,7 +2799,6 @@ def run_puiseux_error_triage_eval(
         return None
 
     # Effective Puiseux flip radius (censored at r_max when no flip is observed).
-    # NOTE: because we now return r_max when no flip is found, this should be finite and meaningful.
     if 'r_flip_cens' in df.columns:
         r_flip_puiseux = pd.to_numeric(df['r_flip_cens'], errors='coerce')
         # fallback: if NaN, use the max finite censoring radius observed
@@ -2842,9 +2833,6 @@ def run_puiseux_error_triage_eval(
     else:
         score_xai = None
 
-    # Puiseux dominance proxy:
-    # Empirically, in the "silent-failure high-confidence PVC" cohort, **r_dom itself** was informative
-    # (not necessarily its inverse). We include both directions to avoid sign mistakes.
     score_r_dom = None
     score_inv_r_dom = None
     if 'r_dom' in df.columns:
@@ -2887,7 +2875,7 @@ def run_puiseux_error_triage_eval(
     if 'frac_kink' in df.columns:
         score_kink = pd.to_numeric(df['frac_kink'], errors='coerce').fillna(0.0).astype(float).values
 
-    # NEW: Puiseux term-spectrum proxies (robust to fractional powers)
+    # Puiseux term-spectrum proxies (robust to fractional powers)
     score_inv_ronset_min = None
     if 'puiseux_r_onset_min' in df.columns:
         r_on = pd.to_numeric(df['puiseux_r_onset_min'], errors='coerce').astype(float).values
@@ -2946,8 +2934,7 @@ def run_puiseux_error_triage_eval(
     if score_inv_abs_cnext is not None:
         scores['puiseux_inv_abs_cnext'] = score_inv_abs_cnext
 
-    # Combined heuristic: Puiseux flip score × gradient norm
-    # (often highlights "sharp but nearby" boundaries)
+
     try:
         scores['Attack:inv_rflip_cens_x_gradnorm'] = score_attack_inv_rflip * score_grad_norm
     except Exception:
@@ -3115,7 +3102,7 @@ if __name__ == "__main__":
         pass
 
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-    BASE_DIR = os.path.dirname(SCRIPT_DIR)  # katalog nadrzędny projektu
+    BASE_DIR = os.path.dirname(SCRIPT_DIR)
     DEFAULT_OUT_DIR = os.path.join(BASE_DIR, "post_processing_real")
 
     OUT_DIR = os.path.abspath(args.out_dir) if getattr(args, "out_dir", "") else DEFAULT_OUT_DIR
@@ -3165,7 +3152,7 @@ if __name__ == "__main__":
 
         sys.exit(0)
 
-    # Persist run args/meta snapshot for paper reproducibility
+    # Persist run args/meta snapshot
     try:
         if _run_meta:
             with open(os.path.join(OUT_DIR, "run_meta.snapshot.json"), "w") as f:
@@ -3176,13 +3163,12 @@ if __name__ == "__main__":
     except Exception as e:
         logger.warning("Failed to write run snapshot JSONs: %s", e)
 
-    # Copy key provenance files into OUT_DIR (paper appendix convenience)
+    # Copy key provenance files into OUT_DIR
     copy_if_exists(os.path.join(IN_DIR, "artifact_manifest.json"), OUT_DIR, new_name="artifact_manifest.snapshot.json")
     copy_if_exists(os.path.join(IN_DIR, "run.log"), OUT_DIR, new_name="run.snapshot.log")
     copy_if_exists(os.path.join(IN_DIR, "pip_freeze.txt"), OUT_DIR, new_name="pip_freeze.snapshot.txt")
 
 
-    # Paper reproducibility: exact CLI + versions + this script snapshot
     try:
         with open(os.path.join(OUT_DIR, "run_command.txt"), "w") as f:
             f.write(" ".join(sys.argv) + "\n")
@@ -3417,8 +3403,7 @@ if __name__ == "__main__":
         logger.info("Anchor filters applied: %d -> %d", up_list_before, len(up_list_filt))
     up_list = up_list_filt
 
-    # --- BSPC Option A: relative "high-confidence" cohort via pmax quantile / top-K ---
-    # Applied AFTER the absolute filters above (pred/true/accepted/pmax_min/pmax_max).
+    # --- Option A: relative "high-confidence" cohort via pmax quantile / top-K ---
     q_pmax = float(getattr(args, "filter_pmax_quantile", -1.0))
     topk_pmax = int(getattr(args, "filter_pmax_topk", 0) or 0)
 
@@ -3439,7 +3424,7 @@ if __name__ == "__main__":
         pvals = pvals[np.isfinite(pvals)]
 
         if pvals.size == 0:
-            logger.warning("[BSPC] pmax-quantile/topK requested but pmax is NaN for all anchors -> skipping.")
+            logger.warning("pmax-quantile/topK requested but pmax is NaN for all anchors -> skipping.")
         else:
             before = len(up_list)
 
@@ -3452,7 +3437,7 @@ if __name__ == "__main__":
                     if np.isfinite(pm) and pm >= thr:
                         up_new.append(u)
                 up_list = up_new
-                logger.info("[BSPC] Applied pmax-quantile: q=%.3f -> thr=%.6f | %d -> %d",
+                logger.info("Applied pmax-quantile: q=%.3f -> thr=%.6f | %d -> %d",
                             q_pmax, thr, before, len(up_list))
                 before = len(up_list)
 
@@ -3690,7 +3675,6 @@ if __name__ == "__main__":
 
     logger.info("Uncertain points: total=%d, selected_for_deep=%d", len(up_list_all), len(up_list))
 
-    # Persist selected points index for reproducibility
     try:
         rows = []
         for k, u in enumerate(up_list):
@@ -4221,7 +4205,7 @@ if __name__ == "__main__":
                     model, xstar,
                     delta=DELTA_LOCAL, degree=degree_used, n_samples=n_samples_used,
                     device=device,
-                    calibrator=cal,            # <<< NEW
+                    calibrator=cal,            
                     remove_linear=True,
                     exclude_kink_eps=kink_eps_used, weight_by_distance=True,
                     return_diag=True
@@ -4260,9 +4244,9 @@ if __name__ == "__main__":
                     delta=DELTA_LOCAL,
                     n_samples=NS_QUAL,
                     device=device,
-                    calibrator=cal,            # <<< NEW
-                    fit_diag=fit_diag,         # <<< NEW
-                    include_linear_and_const=True  # <<< NEW
+                    calibrator=cal,            
+                    fit_diag=fit_diag,         
+                    include_linear_and_const=True  
                 )
 
             except Exception as e:
@@ -4310,7 +4294,7 @@ if __name__ == "__main__":
                 i, refit_attempts, max_refit, n_samples_used, degree_used, kink_eps_used
             )
 
-        # Persist diagnostics for this point (paper reproducibility)
+        # Persist diagnostics for this point 
         try:
             diag_out = {
                 "point": int(i),
@@ -4340,7 +4324,7 @@ if __name__ == "__main__":
 
 
         # ------------------------------------------------------------------
-        # (B) Puiseux expansions + interpretation (ONLY if surrogate is trustworthy)
+        # (B) Puiseux expansions + interpretation 
         # ------------------------------------------------------------------
         if (not fit_ok) or (F_expr_zero is None):
             expansions_np = []
@@ -4436,7 +4420,7 @@ if __name__ == "__main__":
                     "reason": "",
                 })
 
-        # Export traces + summary — ALWAYS
+        # Export traces + summary
         try:
             df_tr = pd.DataFrame(traces_rows)
             if df_tr.empty:
@@ -4463,7 +4447,7 @@ if __name__ == "__main__":
         except Exception as e:
             logger.warning("Failed to write robustness CSVs for point %d: %s", i, e)
 
-        # Plot — ALWAYS attempt
+        # Plot
         try:
             robustness_plot_path = os.path.join(OUT_DIR, f"robustness_curves_point{i}.png")
             plot_robustness_traces_calibrated(traces_rows, save_path=robustness_plot_path)
@@ -4475,8 +4459,6 @@ if __name__ == "__main__":
         # ------------------------------------------------------------------
         # (D) LIME & SHAP with temperature (apply scaler consistently)
         # ------------------------------------------------------------------
-        # NOTE: uncertain_full.csv stores X already in *model input space* (scaled by scaler_full in up_real.py).
-        # Therefore: DO NOT transform xstar again here.
         xstar_model = xstar.reshape(1, -1).astype(np.float32)
 
         def predict_proba_np(X_np: np.ndarray) -> np.ndarray:
@@ -4652,7 +4634,7 @@ if __name__ == "__main__":
         def _min_flip_two_sides(vec):
             r1 = _flip_radius_along_vector(model, xstar, vec, device, cal, r_max=r_max_eff, steps=ROBUST_STEPS)
             r2 = _flip_radius_along_vector(model, xstar, -vec, device, cal, r_max=r_max_eff, steps=ROBUST_STEPS)
-            # Treat missing as censored at r_max_eff (deployment-safe semantics).
+
             if r1 is None:
                 r1 = float(r_max_eff)
             if r2 is None:
@@ -4736,8 +4718,7 @@ if __name__ == "__main__":
             "gpu_peak_mb": float("nan"),
         }
 
-        # NOTE: even if --skip_benchmark is enabled, we already computed an effective gradient norm
-        # in the axis-baseline block (grad_norm_eff). Persist it so downstream triage can compare
+
         # Puiseux scores vs cheap gradient baselines without re-running the full benchmark.
         try:
             if 'grad_norm_eff' in locals() and np.isfinite(grad_norm_eff):
@@ -4782,7 +4763,7 @@ if __name__ == "__main__":
             except Exception as e:
                 logger.warning("Saliency benchmark failed for point %d: %s", i, e)
 
-        # Always write a resource file (paper bundles like having it consistently)
+        # write a resource file
         res_txt = os.path.join(OUT_DIR, f"resource_point{i}.txt")
         try:
             with open(res_txt, "w") as fz:
@@ -5079,7 +5060,7 @@ if __name__ == "__main__":
             f_out.write("=" * 80 + "\n")
 
     # ==================================================================
-    # Calibration CI table (paper-grade): use record-level CV results from up_real
+    # Calibration CI table: use record-level CV results from up_real
     # ==================================================================
     try:
         cv_multi = os.path.join(IN_DIR, "cv_metrics_per_fold_multi.csv")
@@ -5283,9 +5264,6 @@ if __name__ == "__main__":
     print("\n[INFO] Completed analysis for all uncertain points.")
 
 
-    # ----------------------------------------------------------------------
-    # FINAL (paper-ready): always write summary + README + manifest + optional zip
-    # ----------------------------------------------------------------------
     try:
         write_paper_summary_md(
             out_dir=OUT_DIR,

@@ -28,7 +28,7 @@ This repository implements a **post-hoc audit / triage pipeline** for ECG classi
 ---
 
 
-## Project Structure
+## Project Structure (tree view)
 ```
 ├── mit‑bih/                      # Raw MIT‑BIH dataset
 ├── mit_bih_pre/                  # Preprocessing scripts for MIT‑BIH
@@ -55,13 +55,13 @@ This repository implements a **post-hoc audit / triage pipeline** for ECG classi
 ## Installation
 1. Clone the repository:
    ```bash
-   git clone https://github.com/piotrmgs/mit-bih-triagle.git
-   cd puiseux-cvnn
+   git clone https://github.com/piotrmgs/mit-np-triage.git
+   cd mit-np-triage
    ```   
 2. Create a virtual environment and install dependencies:
    ```bash
    conda env create -f environment.yml
-   conda activate mit-bih-triagle
+   conda activate mit-np-triage
    ```
 
 ---
@@ -83,6 +83,11 @@ By downloading the files you agree to its terms.
 ## Reproducing the paper results
 
 All commands below are meant to be executed **from the repository root**.
+
+**Paper setting (required for reproducing the reported mean±sd numbers):**
+run the full pipeline for **five random seeds**:
+`11111, 22222, 33333, 44444, 55555`.
+Each seed produces one held-out full-test fold (5 records) from which we sample two per-record balanced cohorts (`n=1000` each), and we report mean±sd across seeds.
 
 ### 1) Train + export full-test predictions (per seed)
 
@@ -269,6 +274,8 @@ PY
 ### 6) Optional: small “resource benchmark” (paper appendix)
 
 The paper reports a small compute-cost benchmark using `max_points=30` (single seed).
+This benchmark is intended to document **runtime scale** (seconds per sample) and does not
+affect the main across-seed triage results.
 
 ```bash
 python -m post_processing_real.post_processing_real \

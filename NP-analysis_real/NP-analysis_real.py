@@ -1,11 +1,30 @@
-# Copyright (c) 2025 Piotr Migus
+# Copyright (c) 2026 Piotr Migus
 # This code is licensed under the MIT License.
 # See the LICENSE file in the repository root for full license information.
 
 """
-Build Newton–Puiseux evidence by joining anchors, benchmark TXT, and
-dominant-ratio CSV produced by post_processing_*.
+Newton–Puiseux evidence builder from post_processing_* artifacts.
+
+Modes:
+- classic: join anchors (uncertain_full[_ext].csv) + benchmark_point*.txt + dominant_ratio_summary.csv;
+  build r_dom vs observed flip evidence + PR/AUPRC triage over "fragile" points (flip within --radius_budget).
+- bspc_error: load selected_uncertain_points.csv (+ dominant_ratio_summary.csv, local_fit_summary.csv);
+  evaluate error-triage (label=--label_col, default is_error), with optional bootstrap CIs and budget curves.
+
+Inputs:
+- classic expects sibling dirs: up_{real|radio}/ and post_processing_{real|radio}/ (auto-detected).
+- bspc_error expects --pp_dirs list of post_processing dirs containing selected_uncertain_points.csv.
+
+Outputs:
+- Joined tables: evidence_anchors_joined.csv, corr_summary.csv, triage_compare_summary.csv,
+  (and in bspc_error: <cohort>__auprc.csv, <cohort>__budget_curve.csv, paper_summary_bspc.md).
+- Figures under figures/ (classic) or <out_dir>/fig/ (bspc_error).
+
+Notes:
+- Join key is 'point' (must be consistent with post_processing enumeration).
+- Parses benchmark TXT by regex; if report format changes, update parse_benchmark_file().
 """
+
 
 import re
 import glob
@@ -38,7 +57,6 @@ def _first_existing(pp_dir: Path, candidates):
 def load_sensitivity_outputs(pp_dir: Path):
     """
     Load sensitivity artifacts produced by post_processing_real.
-    Tolerates historical typos: 'sensivity_*' vs 'sensitivity_*'.
     """
     p_det = _first_existing(pp_dir, ["sensitivity_detailed.csv", "sensivity_detailed.csv"])
     p_mul = _first_existing(pp_dir, ["sensitivity_multi.csv", "sensivity_multi.csv"])
@@ -170,17 +188,17 @@ def parse_benchmark_file(txt_path: str) -> dict:
         "cond": np.nan,
         "rank": np.nan,
         "n_monomials": np.nan,
-        "degree_used": np.nan,   # NEW
-        "retry": np.nan,         # NEW
+        "degree_used": np.nan,  
+        "retry": np.nan,         
 
         "RMSE": np.nan,
         "MAE": np.nan,
         "Pearson": np.nan,
         "Sign_Agreement": np.nan,
-        "resid_mean": np.nan,    # NEW
-        "resid_std": np.nan,     # NEW
-        "resid_skew": np.nan,    # NEW
-        "resid_kurt": np.nan,    # NEW
+        "resid_mean": np.nan,    
+        "resid_std": np.nan,
+        "resid_skew": np.nan,
+        "resid_kurt": np.nan,
 
         "flip_radii": [],
         "min_flip_radius": np.nan,
@@ -189,12 +207,12 @@ def parse_benchmark_file(txt_path: str) -> dict:
         "saliency_ms": np.nan,
         "saliency_cpu_dRSS_MB": np.nan,
         "saliency_gpu_peak_MB": np.nan,
-        "saliency_grad_norm": np.nan,  # NOTE: the trailing comma was needed in the log line
+        "saliency_grad_norm": np.nan, 
 
         "r_dom_pred": np.nan,
-        "flip_grad": np.nan,     # NEW default
-        "flip_lime": np.nan,     # NEW default
-        "flip_shap": np.nan,     # NEW default
+        "flip_grad": np.nan,
+        "flip_lime": np.nan,
+        "flip_shap": np.nan,
     }
 
     m_pt = re.search(r'point(\d+)', p.name)
@@ -429,7 +447,7 @@ def load_dom_ratio(pp_dir: Path) -> pd.DataFrame:
         "point_id": "point",
         "max_abs_c2": "c2_max_abs",
         "max_abs_c4": "c4_max_abs",
-        "r_flip": "r_flip_obs",  # old naming -> new canonical
+        "r_flip": "r_flip_obs",  
     })
 
 
@@ -467,9 +485,6 @@ def parse_args():
     p = argparse.ArgumentParser()
 
 
-    # -------------------------
-    # New BSPC-focused analysis
-    # -------------------------
     p.add_argument(
         "--mode",
         type=str,
@@ -478,7 +493,7 @@ def parse_args():
         help=(
             "Which analysis to run. "
             "'bspc_error' reads post_processing artefacts (selected_uncertain_points.csv, "
-            "dominant_ratio_summary.csv, local_fit_summary.csv) and produces publication-ready "
+            "dominant_ratio_summary.csv, local_fit_summary.csv) and produces "
             "error-triage plots/tables. "
             "'classic' keeps the legacy behaviour."
         ),
@@ -1151,7 +1166,6 @@ def plot_pr_curves(
     plt.xlabel("Recall")
     plt.ylabel("Precision")
     plt.title(title)
-    # Many labels -> smaller font helps for paper screenshots too.
     plt.legend(loc="best", fontsize=8)
     plt.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
@@ -1322,7 +1336,7 @@ def run_bspc_error_triage(args):
         n_pos = int(np.sum(y))
 
 
-        # --- record / cluster diagnostics (paper-risk mitigation) ---
+        # --- record / cluster diagnostics ---
         if "record" in df.columns:
             try:
                 vc = df["record"].astype(str).value_counts()
@@ -1382,9 +1396,6 @@ def run_bspc_error_triage(args):
         # -----------------------------
         # Puiseux geometric proxies
         # -----------------------------
-        # IMPORTANT (BSPC/ECG error triage):
-        # For label=is_error we empirically see higher risk for *larger* r_dom (flat-but-wrong / silent failures),
-        # so we must include r_dom in that direction.
         if "r_dom" in df.columns:
             rdom = pd.to_numeric(df["r_dom"], errors="coerce").values
             _maybe_add_score("Puiseux:r_dom", rdom)
@@ -1392,7 +1403,7 @@ def run_bspc_error_triage(args):
             _maybe_add_score("Puiseux:inv_r_dom", 1.0 / (rdom + 1e-12))
 
 
-        # |c4| – duże |c4| => mniejsze r_dom (bo r_dom ~ sqrt(|c2|/|c4|)) => większe ryzyko
+    
         c2 = None
         c4 = None
         if "c2_max_abs" in df.columns:
@@ -1593,11 +1604,11 @@ def run_bspc_error_triage(args):
 
 
         # -----------------------------
-        # Plots (paper-ready, less confusing)
+        # Plots
         # -----------------------------
-        # 1) we keep a small set -> avoids "missing curve" illusion due to exact overlaps (e.g., r_dom vs |c2|/|c4|)
-        # 2) main PR plot uses per_score mode (always shows every method)
-        # 3) we also write a common-set PR plot for fairness
+        # 1) we keep a small set
+        # 2) main PR plot uses per_score mode
+        # 3) we also write a common-set PR plot
 
         # Build missingness map (fallback-safe)
         miss_map = {}
@@ -1646,7 +1657,7 @@ def run_bspc_error_triage(args):
 
         # PR plots
         if pr_scores:
-            # Per-score PR (robust; fixes the "missing curve" complaint)
+            # Per-score PR
             plot_pr_curves(
                 y,
                 pr_scores,
@@ -1727,7 +1738,7 @@ def run_bspc_error_triage(args):
             y108 = _to_int01(df108[args.label_col]).values
             if len(np.unique(y108)) >= 2 and ("r_dom" in df108.columns):
                 r108 = pd.to_numeric(df108["r_dom"], errors="coerce").values
-                s108 = 1.0 / (r108 + 1e-12)  # inv_r_dom: większe = bardziej ryzykowne
+                s108 = 1.0 / (r108 + 1e-12)  
                 auc, lo, hi = auroc_with_ci(
                     y108, s108,
                     n_boot=max(500, int(args.bootstrap // 2)),
@@ -1829,7 +1840,7 @@ def main():
 
     df_sens_det, df_sens_mul, sens_txt = load_sensitivity_outputs(PP_DIR)
 
-    # Copy the budget-policy table to NP-analysis outputs for paper packaging
+    # Copy the budget-policy table to NP-analysis outputs
     if df_sens_mul is not None and len(df_sens_mul):
         out_pol = OUT_DIR / "triage_policy_multi_budget.csv"
         df_sens_mul.to_csv(out_pol, index=False)
@@ -1994,7 +2005,7 @@ def main():
         if np.isfinite(scores).any() and y_true.sum() > 0:
             rec, prec, auprc_c4, df_curve = precision_recall_from_scores(y_true, scores)
 
-            # F1 along the curve (skip the initial (1, 0) point).
+
             with np.errstate(divide="ignore", invalid="ignore"):
                 f1 = 2 * prec[1:] * rec[1:] / np.clip(prec[1:] + rec[1:], 1e-12, None)
             if len(f1) > 0:

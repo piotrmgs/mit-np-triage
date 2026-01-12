@@ -80,7 +80,7 @@ By downloading the files you agree to its terms.
 
 ---
 
-## Reproducing the BSPC paper results
+## Reproducing the paper results
 
 All commands below are meant to be executed **from the repository root**.
 

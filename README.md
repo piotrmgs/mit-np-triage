@@ -2,7 +2,7 @@
 
 Code to reproduce the experiments in:
 
-> **Auditing High-Confidence ECG Predictions with a Newton–Puiseux Onset Score**  
+> **Post-hoc accept-set auditing with a Newton--Puiseux onset score**  
 
 This repository implements a **post-hoc audit / triage pipeline** for ECG classification, with a focus on **silent failures** (high-confidence misclassifications inside an accept set defined by a confidence threshold). The main contribution is the **Newton–Puiseux onset score** `r_dom` (NP-onset), used **only as a ranking signal** to allocate a limited audit budget within accepted predictions.
 
